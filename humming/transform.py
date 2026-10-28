@@ -705,7 +705,8 @@ def transform_mfma_tensors(config: LayerConfig, tensors: dict[str, torch.Tensor]
     """ROCm: padded Humming tensors -> the gfx950 MFMA GEMM layout (docs/rocm/mfma_layout.md).
 
     weight [N, K * bits / 32] int32 (MFMA fragment order), weight_scale [groups, N] in the
-    activation dtype, zero_point [groups, N] uint8, bias [N] unchanged.
+    activation dtype, zero_point [groups, N] uint8, bias [N] unchanged. MoE layers keep a
+    leading expert dim on every tensor ([E, N, ...], [E, groups, N], bias [E, N]).
     """
     from humming.kernel.humming_mfma import check_mfma_layer_config
     from humming.rocm import layout
@@ -715,12 +716,15 @@ def transform_mfma_tensors(config: LayerConfig, tensors: dict[str, torch.Tensor]
     a_dtype = dtypes.torch_dtype_map[config.a_dtype]
 
     weight = tensors["weight"]
-    # Bound the int64 temporaries of the pure-torch repack to ~2^26 codes per chunk.
+    # Bound the int64 temporaries of the pure-torch repack to ~2^26 codes per chunk. MoE weights
+    # [E, N, K * bits / 32] are repacked as [E * N, ...]: chunks of 16 rows never straddle experts.
+    weight_shape = weight.shape
+    weight = weight.reshape(-1, weight_shape[-1])
     rows_per_chunk = max(16, (1 << 26) // config.shape_k // 16 * 16)
     weight = torch.cat(
         [layout.repack_weight_for_mfma(chunk, num_bits) for chunk in weight.split(rows_per_chunk, dim=0)],
         dim=0,
-    )
+    ).reshape(weight_shape)
     outputs = {"weight": weight.contiguous()}
     outputs["weight_scale"] = layout.transform_weight_scale(tensors["weight_scale"], a_dtype)
     if config.has_zero_point:

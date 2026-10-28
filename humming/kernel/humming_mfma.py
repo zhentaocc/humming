@@ -7,7 +7,8 @@ launcher, which recognises MFMA kernels and launches them on torch's current str
 
 Supported: fp16/bf16 activations x unsigned INT1-8 weights (implicit zero point 2^(bits-1) or
 explicit uint8 zero points), per-channel or group (multiple of 32) scales, optional bias, dense
-GEMM. Everything else raises ``NotImplementedError``.
+GEMM and MoE GEMM (indexed / grouped_contiguous / grouped_masked, the kernel in
+``humming_mfma_moe.py``). Everything else raises ``NotImplementedError``.
 """
 
 import dataclasses
@@ -56,8 +57,6 @@ def get_mfma_group_size(layer_config: LayerConfig) -> int:
 
 
 def get_mfma_unsupported_reason(layer_config: LayerConfig) -> str | None:
-    if layer_config.num_experts:
-        return "MoE layers (num_experts > 0)"
     if layer_config.a_dtype not in (dtypes.float16, dtypes.bfloat16):
         return f"activation dtype {layer_config.a_dtype} (only float16/bfloat16 activations)"
     if layer_config.c_dtype != layer_config.a_dtype:
@@ -95,10 +94,20 @@ def check_mfma_layer_config(layer_config: LayerConfig) -> None:
         raise NotImplementedError(f"Humming on ROCm (gfx950 MFMA GEMM) does not support {reason}.")
 
 
+def check_mfma_gemm_type(layer_config: LayerConfig, gemm_type) -> GemmType:
+    """Dense layers run the dense kernel, MoE layers (num_experts > 0) one of the MoE layouts."""
+    gemm_type = GemmType.DENSE if gemm_type is None else GemmType(gemm_type)
+    if layer_config.num_experts and gemm_type == GemmType.DENSE:
+        raise NotImplementedError(
+            "Humming on ROCm runs MoE layers (num_experts > 0) as an indexed / grouped_contiguous / "
+            "grouped_masked GEMM; pass compute_config={'gemm_type': ...}."
+        )
+    if not layer_config.num_experts and gemm_type != GemmType.DENSE:
+        raise NotImplementedError(f"gemm_type={gemm_type.value} needs an MoE layer (num_experts > 0).")
+    return gemm_type
+
+
 def check_mfma_compute_config(compute_config: dict) -> None:
-    gemm_type = compute_config.get("gemm_type")
-    if gemm_type is not None and GemmType(gemm_type) != GemmType.DENSE:
-        raise NotImplementedError(f"Humming on ROCm supports dense GEMM only, got gemm_type={gemm_type}.")
     for name in ("use_f16_accum", "use_batch_invariant", "use_m_major_input_scale"):
         if compute_config.get(name):
             raise NotImplementedError(f"Humming on ROCm does not support compute_config {name}=True.")
@@ -178,16 +187,17 @@ def resolve_mfma_configs(layer_config, compute_config, tuning_config, device=Non
         layer_config_obj = LayerConfig(**layer_obj)
         layer_config_obj.check_device(device_index)
         check_mfma_layer_config(layer_config_obj)
+        gemm_type = check_mfma_gemm_type(layer_config_obj, compute_obj.get("gemm_type"))
         layer_obj["sm_version"] = layer_config_obj.sm_version
         if not tuning_obj:
-            tuning_obj = get_heuristics_config(layer_config_obj, device=device_index)
+            tuning_obj = get_heuristics_config(layer_config_obj, gemm_type=gemm_type.value, device=device_index)
     return layer_obj, compute_obj, _tuning_entries(tuning_obj)
 
 
 def prepare_mfma_kernels(layer_config, compute_config, tuning_config, device=None) -> torch.Tensor:
     """Compile/register the kernels of every M interval; returns the launcher's int64 config tensor."""
     device_index = get_device_index(device)
-    layer_obj, _, entries = resolve_mfma_configs(layer_config, compute_config, tuning_config, device_index)
+    layer_obj, compute_obj, entries = resolve_mfma_configs(layer_config, compute_config, tuning_config, device_index)
     layer_config_obj = LayerConfig(**layer_obj)
     common = {
         "a_dtype": str(layer_config_obj.a_dtype),
@@ -195,11 +205,18 @@ def prepare_mfma_kernels(layer_config, compute_config, tuning_config, device=Non
         "group_size": get_mfma_group_size(layer_config_obj),
         "has_zero_point": layer_config_obj.has_zero_point,
     }
+    kernel_cls = HummingMfmaKernel
+    gemm_type = check_mfma_gemm_type(layer_config_obj, compute_obj.get("gemm_type"))
+    if gemm_type != GemmType.DENSE:
+        from humming.kernel.humming_mfma_moe import HummingMfmaMoeKernel
+
+        kernel_cls = HummingMfmaMoeKernel
+        common["gemm_type"] = gemm_type.value
     tile_fields = {field.name for field in dataclasses.fields(MfmaTile)} | {"max_splits"}
     specs = []
     for _, _, config in entries:
         kernel_args = common | {key: value for key, value in config.items() if key in tile_fields}
-        specs.append((HummingMfmaKernel, kernel_args))
+        specs.append((kernel_cls, kernel_args))
     kernels = KernelRuntime.compile_many(specs, device_index)
     num_cus = 0  # the launcher queries the CU count
     values = []
@@ -218,3 +235,14 @@ def get_mfma_gemm_meta(layer_config: str) -> tuple[int, int, int]:
 def _parse_mfma_gemm_meta(layer_config: str) -> tuple[int, int, int]:
     layer_obj = json.loads(layer_config)
     return int(layer_obj["shape_n"]), int(layer_obj.get("pad_shape_n", 0)), int(layer_obj.get("pad_shape_k", 0))
+
+
+@torch.compiler.assume_constant_result
+def get_mfma_num_experts(layer_config: str) -> int:
+    """``num_experts`` of a ROCm layer config string (0 for dense layers)."""
+    return _parse_mfma_num_experts(layer_config)
+
+
+@functools.lru_cache(maxsize=1024)
+def _parse_mfma_num_experts(layer_config: str) -> int:
+    return int(json.loads(layer_config).get("num_experts") or 0)

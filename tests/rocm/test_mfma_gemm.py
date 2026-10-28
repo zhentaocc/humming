@@ -1,9 +1,12 @@
 """Correctness of the gfx950 MFMA weight-only GEMM against an FP32 torch reference."""
 
+import dataclasses
+
 import pytest
 import torch
 
-from tests.rocm.mfma_gemm import MfmaTile, mfma_gemm
+from humming.tune import gfx950
+from tests.rocm.mfma_gemm import MfmaTile, mfma_gemm, select_tile
 from tests.rocm.quant_utils import TOLERANCE, error_stats, make_quantized_linear
 
 
@@ -47,6 +50,7 @@ def test_small_shapes(dtype, num_bits, group_size, has_zero_point, shape_m):
         MfmaTile(2, 2, 4, 4, 2, lds_a=True),
         MfmaTile(1, 4, 2, 2, 3, lds_a=True),
         MfmaTile(1, 4, 8, 2, 2, lds_a=True, scale_b=True),
+        MfmaTile(1, 4, 8, 4, 2, lds_a=True, scale_b=True),
     ],
 )
 @pytest.mark.parametrize("num_splits", [1, 2, 3, 8])
@@ -64,6 +68,40 @@ def test_lds_a_tile(dtype, num_bits, group_size, shape_m, scale_b):
     tile = MfmaTile(1, 4, 8, 2, 2, lds_a=True, scale_b=scale_b) if scale_b else MfmaTile(2, 2, 4, 4, 2, lds_a=True)
     _, rel = run_case(shape_m, 384, 1024, num_bits, group_size, group_size > 0, dtype, tile=tile)
     assert rel < TOLERANCE[dtype]
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("num_bits", [1, 2, 3, 4, 5, 8])
+@pytest.mark.parametrize("group_size", [0, 128])
+@pytest.mark.parametrize("has_zero_point", [False, True])
+@pytest.mark.parametrize("shape_m", [77, 300])
+def test_wide_tile(dtype, num_bits, group_size, has_zero_point, shape_m):
+    """The 128 x 256 tile picked for large-M FP16 (tune/gfx950.py), also checked with BF16."""
+    if has_zero_point and group_size == 0:
+        pytest.skip("zero point is tested group-wise")
+    tile = MfmaTile(1, 4, 8, 4, 2, lds_a=True, scale_b=True)
+    _, rel = run_case(shape_m, 768, 1024, num_bits, group_size, has_zero_point, dtype, tile=tile)
+    assert rel < TOLERANCE[dtype]
+
+
+@pytest.mark.parametrize("is_bfloat16", [False, True])
+@pytest.mark.parametrize("shape_n", [1024, 4096, 8192, 28672, 57344, 131072])
+def test_tile_buckets(is_bfloat16, shape_n):
+    """Each M interval of the tuner maps to one tile, and the test mirror agrees with it."""
+    num_cus = 256
+    intervals = gfx950.get_m_intervals(shape_n, num_cus, is_bfloat16)
+    assert intervals[0][0] == 0 and intervals[-1][1] == 1 << 30
+    for (_, high), (low, _) in zip(intervals, intervals[1:]):
+        assert high == low
+    for low, high in intervals:
+        probes = {low + 1, min(high, low + 129), min(high, 1 << 16)}
+        tiles = {gfx950.select_tile(m, shape_n, num_cus, is_bfloat16) for m in probes}
+        assert len(tiles) == 1, (low, high, tiles)
+        for m in probes:
+            mirror, _ = select_tile(m, shape_n, 4096, num_cus, is_bfloat16)
+            assert dataclasses.asdict(mirror) == dataclasses.asdict(next(iter(tiles)))
+    wide = gfx950.select_tile(1 << 16, shape_n, num_cus, is_bfloat16)
+    assert wide.tiles_n == (2 if is_bfloat16 else 4)
 
 
 def test_split_k_repeated_launches():

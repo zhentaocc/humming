@@ -130,7 +130,7 @@ def main():
     for shape_n, shape_k in shapes:
         linear = make_quantized_linear(shape_n, shape_k, args.bits, args.group, args.zp, dtype)
         for shape_m in ms:
-            selected_tile, selected_splits = select_tile(shape_m, shape_n, shape_k)
+            selected_tile, selected_splits = select_tile(shape_m, shape_n, shape_k, is_bfloat16=dtype == torch.bfloat16)
             used_tile = tile or selected_tile
             used_splits = args.splits or selected_splits
             t = used_tile

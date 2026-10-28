@@ -67,25 +67,35 @@ M_INTERVALS = ((0, 8), (8, 32), (32, 64), (64, 1 << 30))
 # spread over the layer's experts), never from N, so that the w13 and w2 GEMMs of one layer pick
 # the same block_m for one valid_shape_m: vLLM aligns the routing once (moe_align_block_size with
 # the w13 config's block_shape[0]) and reuses it for w2.
-MOE_ROWS_PER_EXPERT_BUCKETS = (16, 32, 64)
+# Thresholds on valid_shape_m (tokens * top_k) itself, then on rows per expert
+# (valid_shape_m / num_experts). Tuned on Mixtral / Qwen3-30B-A3B / DeepSeek-V3 shapes, W4 g128,
+# see docs/rocm/log_moe.md.
+MOE_DIRECT_A_MAX_ROWS = 16
+MOE_ROWS_PER_EXPERT_BUCKETS = (8, 16, 256)
 
 
 def select_moe_tile(valid_shape_m: int, num_experts: int) -> MfmaTile:
-    rows_per_expert = math.ceil(valid_shape_m / max(num_experts, 1))
+    num_experts = max(num_experts, 1)
+    if valid_shape_m <= MOE_DIRECT_A_MAX_ROWS:
+        # A handful of routed rows, ~1 per active expert: A straight from global memory (an LDS
+        # copy of a 16-row block that holds one valid row is pure overhead).
+        return MfmaTile(tiles_m=1, tiles_n=1, stages=2)
+    rows_per_expert = math.ceil(valid_shape_m / num_experts)
+    if rows_per_expert <= 8:
+        # Several rows per block: stage A once in LDS for the 4 waves.
+        return MfmaTile(tiles_m=1, tiles_n=1, stages=2, lds_a=True)
     if rows_per_expert <= 16:
-        # Decode: one 16-row MFMA tile, A straight from global memory.
-        return MfmaTile(tiles_m=1, tiles_n=1, stages=4)
-    if rows_per_expert <= 32:
-        return MfmaTile(tiles_m=2, tiles_n=2, stages=2, lds_a=True, scale_b=True)
-    if rows_per_expert <= 64:
-        return MfmaTile(tiles_m=4, tiles_n=2, stages=2, lds_a=True, scale_b=True)
+        return MfmaTile(tiles_m=2, tiles_n=1, stages=2, lds_a=True)
+    if rows_per_expert <= 256:
+        return MfmaTile(tiles_m=4, tiles_n=2, stages=2, lds_a=True)
     return MfmaTile(tiles_m=8, tiles_n=2, stages=2, lds_a=True, scale_b=True)
 
 
 def moe_m_intervals(num_experts: int) -> list[tuple[int, int]]:
-    """valid_shape_m intervals (min exclusive, max inclusive) matching select_moe_tile."""
+    """valid_shape_m intervals (min exclusive, max inclusive), each inside one select_moe_tile case."""
     num_experts = max(num_experts, 1)
-    bounds = [0] + [rows * num_experts for rows in MOE_ROWS_PER_EXPERT_BUCKETS] + [1 << 30]
+    thresholds = {MOE_DIRECT_A_MAX_ROWS} | {rows * num_experts for rows in MOE_ROWS_PER_EXPERT_BUCKETS}
+    bounds = [0] + sorted(thresholds) + [1 << 30]
     return list(zip(bounds[:-1], bounds[1:]))
 
 

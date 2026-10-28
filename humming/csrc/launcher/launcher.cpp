@@ -1,6 +1,6 @@
 #define USE_CUDA 1
 
-#include <cuda.h>
+#include "./gpu_api.h"
 #include <map>
 #include <memory>
 #include <mutex>

@@ -2,7 +2,7 @@
 
 #include <array>
 #include <cstdint>
-#include <cuda.h>
+#include "./gpu_api.h"
 #include <string>
 
 #include "./torch_api.h"

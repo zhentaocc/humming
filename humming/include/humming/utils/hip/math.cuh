@@ -25,11 +25,18 @@ CUDA_INLINE uint32_t prmt(uint32_t a, uint32_t b, uint32_t s) {
   return result;
 };
 
-// lop3: output bit = lut[(a << 2) | (b << 1) | c] per bit position. Expanded as a sum of the
-// LUT's minterms; with a constant LUT the compiler folds it to a few v_bfi/v_and_or/v_xor ops.
+// lop3: output bit = lut[(a << 2) | (b << 1) | c] per bit position.
+// gfx950 has a native LOP3, v_bitop3_b32, with the same truth-table encoding as PTX lop3
+// (checked on MI355X, see docs/rocm/log_mfma.md iteration 5). It matters for the dequant
+// hot loop: gfx9 VOP3 cannot encode literals, so the generic (a & mask) | magic costs two
+// ops plus a constant register. Other targets expand the LUT's minterms; with a constant
+// LUT the compiler folds that to a few v_bfi/v_and_or/v_xor ops.
 template <uint32_t lut>
 CUDA_INLINE uint32_t lop3(uint32_t a, uint32_t b, uint32_t c) {
   static_assert(lut <= 0xFF, "lop3 lut is 8 bits");
+#if defined(__gfx950__)
+  return __builtin_amdgcn_bitop3_b32(a, b, c, lut);
+#else
   uint32_t result = 0;
   static_for<0, 8>([&](auto minterm_index) {
     constexpr uint32_t minterm = decltype(minterm_index)::value;
@@ -41,8 +48,9 @@ CUDA_INLINE uint32_t lop3(uint32_t a, uint32_t b, uint32_t c) {
     }
   });
   return result;
+#endif
 };
 
-CUDA_INLINE uint32_t lop3_and_or(uint32_t a, uint32_t b, uint32_t c) { return (a & b) | c; };
+CUDA_INLINE uint32_t lop3_and_or(uint32_t a, uint32_t b, uint32_t c) { return lop3<(0xF0 & 0xCC) | 0xAA>(a, b, c); };
 
-CUDA_INLINE uint32_t lop3_and_xor(uint32_t a, uint32_t b, uint32_t c) { return (a & b) ^ c; };
+CUDA_INLINE uint32_t lop3_and_xor(uint32_t a, uint32_t b, uint32_t c) { return lop3<(0xF0 & 0xCC) ^ 0xAA>(a, b, c); };

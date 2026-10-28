@@ -114,7 +114,8 @@ def select_tile(
     elif shape_m <= 16:
         tile = MfmaTile(warps_m=1, warps_n=4, tiles_m=1, tiles_n=2, stages=3, lds_a=True, scale_b=True)
     elif shape_m <= 32:
-        tiles_n = 2 if shape_n // 128 >= num_cus // 4 else 1
+        narrow = shape_n // 128 <= num_cus // 8 or (shape_n // 128 < num_cus // 4 and shape_k <= shape_n)
+        tiles_n = 1 if narrow else 2
         tile = MfmaTile(warps_m=1, warps_n=4, tiles_m=2, tiles_n=tiles_n, stages=3, lds_a=True, scale_b=True)
     elif shape_m <= 64:
         tile = MfmaTile(warps_m=1, warps_n=4, tiles_m=4, tiles_n=2, stages=3, lds_a=True, scale_b=True)

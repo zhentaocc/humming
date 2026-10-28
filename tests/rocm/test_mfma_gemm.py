@@ -125,16 +125,28 @@ def test_m64_tile_k_starved(shape_n, shape_k, tiles_m):
         assert dataclasses.asdict(mirror) == dataclasses.asdict(tile)
 
 
-@pytest.mark.parametrize("shape_n,narrow", [(4096, True), (6144, True), (8192, False), (57344, False)])
-def test_small_m_tiles(shape_n, narrow):
-    """M <= 16 uses 16-row blocks; M in (16, 32] uses 32 x 64 blocks for small N."""
+@pytest.mark.parametrize(
+    "shape_n,shape_k,narrow",
+    [
+        (4096, 4096, True),
+        (4096, 28672, True),
+        (5120, 5120, True),
+        (6144, 4096, True),
+        (6144, 8192, False),
+        (5120, 25600, False),
+        (8192, 4096, False),
+        (57344, 8192, False),
+    ],
+)
+def test_small_m_tiles(shape_n, shape_k, narrow):
+    """M <= 16 uses 16-row blocks; M in (16, 32] uses 32 x 64 blocks for small N (and K <= N above 4096)."""
     for shape_m in (9, 12, 16):
-        tile = gfx950.select_tile(shape_m, shape_n, 4096, 256, False, 4)
+        tile = gfx950.select_tile(shape_m, shape_n, shape_k, 256, False, 4)
         assert (tile.tiles_m, tile.tiles_n, tile.lds_a) == (1, 2, True)
     for shape_m in (17, 24, 32):
-        tile = gfx950.select_tile(shape_m, shape_n, 4096, 256, False, 4)
+        tile = gfx950.select_tile(shape_m, shape_n, shape_k, 256, False, 4)
         assert (tile.tiles_m, tile.tiles_n) == (2, 1 if narrow else 2)
-        mirror, _ = select_tile(shape_m, shape_n, 4096, 4, 256)
+        mirror, _ = select_tile(shape_m, shape_n, shape_k, 4, 256)
         assert dataclasses.asdict(mirror) == dataclasses.asdict(tile)
 
 

@@ -69,10 +69,21 @@ def wide_tile_min_m(shape_n: int, num_cus: int) -> int:
 MIN_CHUNKS_PER_SPLIT = 8
 TILE_M64 = MfmaTile(tiles_m=4, tiles_n=2, stages=3, lds_a=True, scale_b=True)
 TILE_M32 = MfmaTile(tiles_m=2, tiles_n=2, stages=3, lds_a=True, scale_b=True)
-# M in (16, 32] with N < num_cus / 4 * 128 (N <= 6144 on 256 CUs): 32 x 64 blocks, 5-15% faster.
+# M in (16, 32] with small N (see use_narrow_m32_tile): 32 x 64 blocks, 5-25% faster.
 TILE_M32_NARROW = MfmaTile(tiles_m=2, tiles_n=1, stages=3, lds_a=True, scale_b=True)
 # M in (8, 16]: 16-row blocks instead of half-empty 32-row ones, 3-12% faster on every shape.
 TILE_M16 = MfmaTile(tiles_m=1, tiles_n=2, stages=3, lds_a=True, scale_b=True)
+
+
+def use_narrow_m32_tile(shape_n: int, shape_k: int, num_cus: int) -> bool:
+    """32 x 64 instead of 32 x 128 blocks for M in (16, 32].
+
+    Always for N <= num_cus / 8 * 128 (4096 on 256 CUs). For N up to num_cus / 4 * 128 only when
+    K <= N: 5120x5120 and 6144x4096 gain 7-14%, but deeper K (6144x8192, 5120x25600) is up to 5%
+    slower with 8-bit weights.
+    """
+    blocks_n = shape_n // 128
+    return blocks_n <= num_cus // 8 or (blocks_n < num_cus // 4 and shape_k <= shape_n)
 
 
 def is_k_starved(tile: MfmaTile, shape_m: int, shape_n: int, shape_k: int, num_cus: int) -> bool:
@@ -88,7 +99,7 @@ def select_tile(shape_m: int, shape_n: int, shape_k: int, num_cus: int, is_bfloa
     if shape_m <= 16:
         return TILE_M16
     if shape_m <= 32:
-        return TILE_M32 if shape_n // 128 >= num_cus // 4 else TILE_M32_NARROW
+        return TILE_M32_NARROW if use_narrow_m32_tile(shape_n, shape_k, num_cus) else TILE_M32
     if shape_m <= 64:
         # 64 rows: one block row for every M in the bucket, so the choice is M-independent.
         return TILE_M32 if is_k_starved(TILE_M64, 64, shape_n, shape_k, num_cus) else TILE_M64

@@ -5,6 +5,81 @@ Humming 走公开 API：`HummingLayer.load_from_tensors → transform() → laye
 对比对象：`torch_dense`（F.linear / hipBLASLt，fp16 权重）、`vllm_triton_w4a16`、`vllm_exllama_gptq`（仅 fp16）、`dequant_triton+hipblaslt`、`aiter_a16w8_int8`、`aiter_a16w8_fp8_block128`。
 “最佳现有实现”指同一配置（dtype / bits / zp）下以上量化实现中最快的一个（不含 torch_dense；dense 单独列出）。
 
+> 第 0 节是第二轮（大 M 优化 + FP8/MX/INT8 激活 + MoE，合并到 `rocm` 分支）的结果；第 1–7 节保留第一轮（`4288c98`）的数据作对照。
+
+## 0. 第二轮：大 M 优化、低比特激活、MoE（2026-10-28）
+
+三条线并行开发（分支 `rocm-perf` / `rocm-f8` / `rocm-moe`），合并后 `pytest tests/rocm`：**1670 passed, 87 skipped**。
+详细过程见 `log_perf.md`、`log_f8.md`、`log_moe.md`。
+
+### 0.1 Dense W4A16/W8A16：大 M 提速 1.14–1.33x
+
+数据：`benchmarks/rocm/results/humming_perf_2026-10-28.{csv,md}`。10 个 shape 的几何平均，vs 最佳现有量化实现（括号：胜出 shape 数；“自身”= 相对第一轮 Humming 的提速）。
+
+| 配置 | M=1 | M=16 | M=64 | M=256 | M=1024 | M=4096 |
+|---|---|---|---|---|---|---|
+| fp16 W4 sym | 4.13x (10/10; 自身 1.00x) | 4.20x (10/10; 1.22x) | 2.98x (10/10; 1.11x) | 1.84x (10/10; 1.12x) | 1.19x (9/10; 1.14x) | 0.95x (0/10; 1.23x) |
+| fp16 W4 zp | 4.14x (10/10; 0.99x) | 4.26x (10/10; 1.19x) | 3.05x (10/10; 1.11x) | 1.85x (10/10; 1.13x) | 1.18x (9/10; 1.14x) | 0.92x (0/10; 1.21x) |
+| fp16 W8 sym | 0.91x (1/10; 1.00x) | 1.07x (6/10; 1.06x) | 1.33x (10/10; 1.05x) | 1.59x (10/10; 1.08x) | 1.07x (7/10; 1.08x) | 0.80x (0/10; 1.09x) |
+| fp16 W8 zp | 3.28x (10/10; 0.99x) | 3.60x (10/10; 1.05x) | 2.99x (10/10; 1.04x) | 1.69x (10/10; 1.09x) | 1.07x (6/10; 1.10x) | 0.80x (0/10; 1.10x) |
+| bf16 W4 sym | 4.31x (10/10; 1.03x) | 4.19x (10/10; 1.33x) | 3.05x (10/10; 1.18x) | 1.78x (10/10; 1.18x) | 1.12x (8/10; 1.23x) | 0.82x (0/10; 1.23x) |
+| bf16 W4 zp | 4.25x (10/10; 1.04x) | 4.20x (10/10; 1.30x) | 3.05x (10/10; 1.17x) | 1.75x (10/10; 1.17x) | 1.10x (8/10; 1.21x) | 0.80x (0/10; 1.21x) |
+| bf16 W8 sym | 0.91x (1/10; 1.00x) | 1.06x (6/10; 1.14x) | 1.28x (10/10; 1.12x) | 1.56x (10/10; 1.15x) | 1.02x (6/10; 1.20x) | 0.76x (0/10; 1.21x) |
+| bf16 W8 zp | 3.80x (10/10; 1.01x) | 3.58x (10/10; 1.13x) | 3.02x (10/10; 1.10x) | 1.67x (10/10; 1.15x) | 1.02x (6/10; 1.20x) | 0.74x (0/10; 1.20x) |
+
+- 有效的改动：A 走 `global_load_lds` 直接进 LDS；更省的 int dequant（15→13 VALU/fragment）；bf16 用 `v_fma_mix_f32` dequant（25→17）；fp16 ≤4bit 在大 M 用 128×256 tile；M≤64 用 3 级流水；M≤16/≤32 的小 tile。
+- 无效的改动：32×32 MFMA 布局、更大的 12×4/16×4 tile、bf16 或 8bit 用 128×256 tile（寄存器溢出）。
+- 目标（M=1024 ≥1.1x、M=4096 ≥0.9x hipBLASLt fp16 dense）**大部分未达到**：fp16 W4 vs hipBLASLt 在 M=1024 为 0.85–1.06x，M=4096 为 0.82–0.89x。
+  - 原因：M≥1024 已是 compute-bound。去掉 dequant 的同一 kernel 跑 1243 us，hipBLASLt 1283 us（8192×28672，M=4096）；实际 kernel 比它慢 17–19%，差距就是 dequant（每个 MFMA 1.66 条 VALU，无法完全被掩盖）。
+  - bf16 在 M=4096 仍比 fp16 慢 14%：dequant 更贵（17 vs 13 VALU），128×256 tile 会溢出，只能用 128×128。
+
+### 0.2 低比特激活：FP8 / MXFP4 / INT8（新增）
+
+数据：`benchmarks/rocm/results/humming_f8_2026-10-28.{csv,md}`（合并后复测 `humming_f8_merged_2026-10-28.*`，FP8/MX 路径不变）。
+
+支持：FP8 e4m3/e5m2 × FP8/FP6/FP4/INT1–5 权重（W8A8、W4A8）；MXFP4 × MXFP4/6/8 和 INT 权重；INT8 × INT1–8。
+weight scale：per-tensor/channel/group、128×128 block、MX E8M0；activation scale：静态 per-tensor、动态 per-token、per-group、E8M0。
+未支持（抛 `NotImplementedError`）：NVFP4、fp16/bf16 激活 × FP 权重、低比特激活的 MoE。
+
+vs 同格式最佳 ROCm kernel（llama3-70b/down，bf16 输出，只计 GEMM）：
+
+| 格式 | M=1 | M=16 | M=1024 | M=4096 | 对手 |
+|---|---|---|---|---|---|
+| FP8 per-token × FP8 per-channel | 1.00x | 0.94x | 0.66x | 0.57x | `torch._scaled_mm` / AITER CK/bpreshuffle |
+| FP8 g128 × FP8 block-128 | 2.34x | 2.16x | 0.97x | 1.00x | AITER blockscale |
+| FP8 × MXFP4（W4A8） | **4.41x** | 1.61x | **2.78x** | 1.97x | AITER a8wfp4 |
+| FP8 × INT4 g128（W4A8） | 1.13x | 1.16x | 1.82x | 1.56x | 最快的 4bit 权重 kernel |
+| MXFP4 × MXFP4 | 1.28x | 1.09x | 0.31x | 0.26x | AITER afp4wfp4 / a4w4 asm |
+| INT8 × INT8 | 1.42x | 1.56x | 1.16x | 0.95x | AITER a8w8 int8 |
+
+- W4A8（INT4 / MXFP4 权重 + FP8 激活）在所有 shape、所有 M 上比任何现有 ROCm 4bit 权重 kernel 快 1.1–4.4x。注：表中 “FP8 × INT4” 对比的 Humming W4A16 是第一轮的数字；合并后 W4A16 bf16 快了 1.1–1.4x，这一行在 M≥1024 的优势会相应缩小。
+- 短板：FP8 per-channel 大 M 只有 hipBLASLt 的 ~0.6x（约 1.7–1.8 PFLOPs vs 2.8）；MXFP4×MXFP4 大 M 只有 AITER 手写汇编的 ~0.3x。两者都需要把权重经 LDS 分级、用更大 tile 重构 kernel。
+- 动态 per-token 量化端到端多 6–8 us（小 M）。
+
+### 0.3 MoE（新增）
+
+数据：基线 `benchmarks/rocm/results/humming_moe_2026-10-28.{csv,md}`；合并后的 Humming `humming_moe_merged_2026-10-28.{csv,md}`。
+单位：一个 MoE block（align + w13 + SiLU·mul + w2 + top-k 加权求和），us。
+
+支持：fp16/bf16 × INT1–8（sym/zp，channel/group），indexed（vLLM 用的）/ grouped_contiguous / grouped_masked 三种布局，w13 + w2，per-expert bias，split-K，graph capture；HIP 单 kernel `moe_align_block_size`（decode 4–5 us）。
+
+W4 vs 最佳现有 ROCm W4 MoE（bf16 为 AITER a16wi4；fp16 无 AITER int4，为 vLLM Triton wna16 调优版）：
+
+| 模型 | dtype | 1 | 16 | 64 | 1024 | 2048 | 8192 tokens |
+|---|---|---|---|---|---|---|---|
+| Qwen3-30B-A3B | bf16 | 20.7 us, 1.20x | 1.44x | 1.27x | 1.69x | 1.33x | 983 us, 1.35x |
+| Mixtral-8x7B | bf16 | 71.5 us, 2.25x | 1.64x | 1.56x | 2.01x | 1.65x | 5889 us, 1.81x |
+| DeepSeek-V3 | bf16 | 47.2 us, 1.47x | 1.41x | 1.29x | 1.58x | 1.40x | 7506 us, 1.53x |
+| Qwen3-30B-A3B | fp16 | 2.12x | 3.12x | 3.12x | 2.43x | 2.08x | 1.92x |
+| Mixtral-8x7B | fp16 | 3.29x | 3.91x | 3.86x | 2.43x | 2.47x | 2.57x |
+| DeepSeek-V3 | fp16 | 3.79x | 4.06x | 4.15x | 3.13x | 3.21x | 2.51x |
+
+- W8：比调优过的 Triton int8 快 1.2–2.4x。
+- 对 16bit 未量化 MoE：合并大 M 优化后，bf16 8192 tokens 下 Mixtral 0.98x、DeepSeek-V3 1.01x、Qwen3 1.10x（合并前 Mixtral/DeepSeek-V3 落后 3–16%）。
+- 合并时的问题：MoE kernel 复用 dense 的 load/mainloop，需跟着改成 direct-to-LDS。改完后 2 级流水的小 tile 每个 chunk 前都要 `vmcnt(0)`，decode 慢 4–9%；MoE 小 tile 改 3 级后比合并前快 0–14%（见 `log_moe.md` 最后一节）。
+- **上游也有的 bug**：`quant_weight.cuh` / `pack_weight.cuh` 用 32 位 offset，>2^32 元素的权重（DeepSeek-V3 w13，7.5G 元素）量化错误（expert ≥146 的 rel_err 0.99），所有平台都受影响；已改 64 位。
+- vLLM 侧要在 ROCm 上启用：`fused_humming_moe.py` 的 `_supports_current_device` 目前只认 CUDA ≥7.5，需加 gfx950；其余（align、activation、`moe_fused_mul_sum`、tile 约定）不用改。
+
 ## 1. 主表：fp16 W4A16 对称 g128
 
 单元格格式：Humming 时间，括号内 M≤16 为有效 TB/s、M≥1024 为 TFLOPs；随后是最佳现有实现的时间与 Humming 加速比；最后是 dense 时间与加速比。
@@ -116,7 +191,15 @@ eager 模式（不用 graph）下，layer 路径每次调用约 30 us host 时�
 
 ## 8. 下一步
 
-前四项来自 log_mfma.md，第五项来自本轮新数据。
+第二轮之后仍未解决的：
+
+1. 大 M 的 dense / FP8 per-channel / MXFP4×MXFP4：需要权重经 LDS 分级 + 更大 tile 的 kernel 结构（现在每个 wave 各自在寄存器里 dequant B），以摊薄 dequant 并接近 MFMA 峰值。
+2. bf16 大 M：dequant 比 fp16 贵，128×256 tile 放不下；需要更省寄存器的 dequant 或上面的 LDS 方案。
+3. 低比特激活的 MoE、NVFP4、fp16/bf16 × FP 权重。
+4. MoE：align kernel 只用一个 workgroup（64k 行时约 55 us）；tile 仅靠启发式，没有 autotune。
+5. 上游：64 位 offset 修复可以作为独立 PR；ROCm 支持需先发 RFC（待确认）。
+
+以下是第一轮的下一步（1–4 已在第二轮尝试，结果见第 0 节和 log_perf.md）。前四项来自 log_mfma.md，第五项来自第一轮数据。
 
 1. 大 M 的 VALU 瓶颈：
    - 用 Marlin 式免移位 int4 dequant（mask + pk_fma）去掉约 48 条 `lshr`；

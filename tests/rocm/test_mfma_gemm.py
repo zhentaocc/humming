@@ -25,7 +25,7 @@ def run_case(shape_m, shape_n, shape_k, num_bits, group_size, has_zero_point, dt
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("num_bits", [2, 3, 4, 8])
+@pytest.mark.parametrize("num_bits", [1, 2, 3, 4, 8])
 @pytest.mark.parametrize("group_size", [0, 32, 64, 128])
 @pytest.mark.parametrize("has_zero_point", [False, True])
 @pytest.mark.parametrize("shape_m", [1, 7, 16, 64, 255])

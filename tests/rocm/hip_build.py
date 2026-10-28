@@ -38,6 +38,8 @@ def build(source: str, name: str, extra_flags: tuple[str, ...] = ()) -> ctypes.C
         "-Wno-unused-result",
         f"-I{INCLUDE_DIR}",
         *extra_flags,
+        # Experiments: e.g. HUMMING_ROCM_EXTRA_FLAGS="-DHUMMING_MFMA_INTERLEAVE=0".
+        *os.environ.get("HUMMING_ROCM_EXTRA_FLAGS", "").split(),
     )
     key_source = "\n".join((source, _headers_digest(), " ".join(flags)))
     key = hashlib.sha256(key_source.encode()).hexdigest()[:16]

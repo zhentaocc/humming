@@ -95,9 +95,23 @@ struct MfmaDequant {
   using BFloat2 = __bf16 __attribute__((ext_vector_type(2)));
   using Float2 = float __attribute__((ext_vector_type(2)));
 
+  // Shift-light path for 1/2/4/8-bit codes (same register assignment as Humming's dequant_b1248,
+  // bit-identical results). A field at bit offset r (r + kBits <= 10) of a 16-bit half is
+  // decoded in place with magic 2^(10 - r): (w & (mask << r)) | bits(2^(10 - r)) is the FP16
+  // value 2^(10 - r) + code. So each word needs at most one shift (by 8) shared by the fields
+  // in its upper byte, instead of one shift per field: int4 drops from 3 to 1 v_lshrrev per
+  // fragment (15 -> 13 VALU with the group scale).
+  static constexpr bool kShiftLight = kBits == 1 || kBits == 2 || kBits == 4 || kBits == 8;
+
+  CUDA_INLINE static constexpr uint32_t magic_bits(uint32_t residual) {
+    return (0x6400u - residual * 0x400u) * 0x00010001u;
+  }
+
   // `zero_point` is the raw code; the result is what run() expects as `prepared_zero_point`.
   CUDA_INLINE static uint32_t prepare_zero_point(uint32_t zero_point) {
-    if constexpr (kHasZeroPoint) {
+    if constexpr (kHasZeroPoint && kShiftLight) {
+      return (zero_point & ((1u << kBits) - 1)) * 0x00010001u;
+    } else if constexpr (kHasZeroPoint) {
       return dequant_single_zero_point<ElementQB, Float16>(zero_point);
     } else {
       return 0;
@@ -105,8 +119,29 @@ struct MfmaDequant {
   }
 
   CUDA_INLINE static void dequant_f16(const uint32_t *qb, uint32_t *regs_b, uint32_t mfma_index, uint32_t prepared_zero_point) {
-    uint32_t zp_vals[4] = {prepared_zero_point, prepared_zero_point, prepared_zero_point, prepared_zero_point};
-    dequant<ElementQB, Float16, kHasZeroPoint, false>(qb, regs_b, mfma_index, zp_vals);
+    if constexpr (kShiftLight) {
+      PRAGMA_UNROLL
+      for (uint32_t i = 0; i < 4; i++) {
+        // Field position of register i, exactly as in dequant_b1248.
+        const uint32_t index = mfma_index * 4 + i;
+        const uint32_t word = index * 2 * kBits / 32;
+        const uint32_t shift = (kBits * 4 % 16 == 0 ? kBits * i : kBits * index) % 16;
+        const uint32_t residual = shift % 8;
+        const uint32_t mask = ((1u << kBits) - 1) * 0x00010001u << residual;
+        const uint32_t value = lop3_and_or(qb[word] >> (shift - residual), mask, magic_bits(residual));
+        uint32_t offset;
+        if constexpr (kHasZeroPoint) {
+          offset = (prepared_zero_point << residual) + magic_bits(residual);
+        } else {
+          offset = (0x00010001u << (kBits - 1) << residual) + magic_bits(residual);
+        }
+        const Half2 result = __builtin_bit_cast(Half2, value) - __builtin_bit_cast(Half2, offset);
+        regs_b[i] = __builtin_bit_cast(uint32_t, result);
+      }
+    } else {
+      uint32_t zp_vals[4] = {prepared_zero_point, prepared_zero_point, prepared_zero_point, prepared_zero_point};
+      dequant<ElementQB, Float16, kHasZeroPoint, false>(qb, regs_b, mfma_index, zp_vals);
+    }
   }
 
   CUDA_INLINE static uint32_t f16x2_to_bf16x2(uint32_t value, float scale) {

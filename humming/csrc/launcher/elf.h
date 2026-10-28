@@ -103,6 +103,10 @@ public:
     return val;
   }
 
+  bool hasSymbol(const std::string &name) const {
+    return symbolOffsets.find(name) != symbolOffsets.end();
+  }
+
   bool getBool(const std::string &name) {
     return getUint32(name) > 0;
   }

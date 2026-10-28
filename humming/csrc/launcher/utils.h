@@ -14,6 +14,7 @@ enum class MmaType : uint32_t {
   WGMMA = 1,
   UMMA = 2,
   MXMMA = 3,
+  MFMA = 4,  // ROCm gfx950 weight-only GEMM (humming_mfma), see mfma.h
 };
 
 inline void check_curesult(const CUresult res, const char *func_name) {

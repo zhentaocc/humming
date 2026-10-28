@@ -593,7 +593,7 @@ class TuningConfig(BaseHummingConfig):
     def mma_type_id(self):
         assert self.mma_type is not None
         value = self.mma_type.value.lower()
-        return ["mma", "wgmma", "umma", "mxmma"].index(value)
+        return ["mma", "wgmma", "umma", "mxmma", "mfma"].index(value)
 
     @property
     def mxmma_native_mixed(self) -> bool:

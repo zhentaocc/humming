@@ -147,9 +147,9 @@ def select_moe_tile(valid_shape_m: int, num_experts: int) -> MfmaTile:
     rows_per_expert = math.ceil(valid_shape_m / num_experts)
     if rows_per_expert <= 8:
         # Several rows per block: stage A once in LDS for the 4 waves.
-        return MfmaTile(tiles_m=1, tiles_n=1, stages=2, lds_a=True)
+        return MfmaTile(tiles_m=1, tiles_n=1, stages=3, lds_a=True)
     if rows_per_expert <= 16:
-        return MfmaTile(tiles_m=2, tiles_n=1, stages=2, lds_a=True)
+        return MfmaTile(tiles_m=2, tiles_n=1, stages=3, lds_a=True)
     if rows_per_expert <= 256:
         return MfmaTile(tiles_m=4, tiles_n=2, stages=2, lds_a=True)
     return MfmaTile(tiles_m=8, tiles_n=2, stages=2, lds_a=True, scale_b=True)

@@ -145,3 +145,26 @@ large-M work happens on a separate branch and would carry over through the share
 * Weight quantization of > 2^32-element tensors was broken before the `quant_weight.cuh` /
   `pack_weight.cuh` fix (affects any platform using these kernels); no unit test covers it because it
   needs > 8 GiB tensors, verified with the DeepSeek-V3 w13 shape instead.
+
+## After merging rocm-perf (2026-10-28, branch rocm)
+
+* `MfmaMoeGemm` copies the dense `load_chunk` / `mainloop`, so it had to follow rocm-perf's direct-to-LDS
+  A path: one `__shared__` buffer per stage, `global_load_lds` with the swizzle applied on the global side
+  (slot `thread_id + i * kNumThreads` is the same slot that `a_row_bytes[i]` already described), and
+  `s_waitcnt vmcnt` + `s_barrier` before each chunk instead of the register-staged LDS store.
+* Same-GPU A/B (best of 2x7, us, one MoE block) showed a real decode regression with the old 2-stage LDS
+  tiles: with direct-to-LDS a 2-stage pipeline waits `vmcnt(0)` before every chunk. 3 stages for the 16- and
+  32-row LDS tiles (`select_moe_tile`) fixes it; the 4x2 tile stays at 2 stages (3 stages: 0.95-1.02x).
+
+| model / dtype / bits / tokens | pre-merge | merged, 2 stages | merged, 3 stages |
+|---|---|---|---|
+| mixtral fp16 W4 16 | 150.5 | 166.2 | 139.0 |
+| mixtral bf16 W4 16 | 174.5 | 171.8 | 153.7 |
+| mixtral fp16 W4 64 | 185.1 | 188.9 | 172.5 |
+| qwen3 fp16 W4 16 | 56.0 | 61.0 | 55.3 |
+| qwen3 bf16 W4 4 | 34.2 | 32.3 | 30.2 |
+| mixtral fp16 W8 16 | 251.8 | 262.3 | 248.8 |
+
+* Prefill gains come for free from the dense kernel work: W4 bf16 at 8192 tokens is 1.09x (Qwen3),
+  1.14x (DeepSeek-V3), 1.17x (Mixtral) faster than before the merge
+  (`benchmarks/rocm/results/humming_moe_merged_2026-10-28.{csv,md}`, Humming only).

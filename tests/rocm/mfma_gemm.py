@@ -111,8 +111,11 @@ def select_tile(
         # Decode: no LDS, one 16-row MFMA tile; wider N per wave only when N gives enough blocks.
         tiles_n = 2 if shape_n // 128 >= num_cus // 2 else 1
         tile = MfmaTile(warps_m=1, warps_n=4, tiles_m=1, tiles_n=tiles_n, stages=4)
+    elif shape_m <= 16:
+        tile = MfmaTile(warps_m=1, warps_n=4, tiles_m=1, tiles_n=2, stages=3, lds_a=True, scale_b=True)
     elif shape_m <= 32:
-        tile = MfmaTile(warps_m=1, warps_n=4, tiles_m=2, tiles_n=2, stages=3, lds_a=True, scale_b=True)
+        tiles_n = 2 if shape_n // 128 >= num_cus // 4 else 1
+        tile = MfmaTile(warps_m=1, warps_n=4, tiles_m=2, tiles_n=tiles_n, stages=3, lds_a=True, scale_b=True)
     elif shape_m <= 64:
         tile = MfmaTile(warps_m=1, warps_n=4, tiles_m=4, tiles_n=2, stages=3, lds_a=True, scale_b=True)
         # K-starved 64x128 grid (< 8 chunks of 128 per split): the 32x128 tile is faster.

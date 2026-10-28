@@ -33,7 +33,7 @@ def run_case(shape_m, shape_n, shape_k, num_bits, group_size, has_zero_point, dt
 @pytest.mark.parametrize("num_bits", [1, 2, 3, 4, 8])
 @pytest.mark.parametrize("group_size", [0, 32, 64, 128])
 @pytest.mark.parametrize("has_zero_point", [False, True])
-@pytest.mark.parametrize("shape_m", [1, 7, 16, 64, 255])
+@pytest.mark.parametrize("shape_m", [1, 7, 16, 32, 64, 255])
 def test_small_shapes(dtype, num_bits, group_size, has_zero_point, shape_m):
     if has_zero_point and group_size == 0:
         pytest.skip("zero point is tested group-wise")
@@ -55,6 +55,8 @@ def test_small_shapes(dtype, num_bits, group_size, has_zero_point, shape_m):
         MfmaTile(1, 4, 8, 4, 2, lds_a=True, scale_b=True),
         MfmaTile(1, 4, 2, 2, 3, lds_a=True, scale_b=True),
         MfmaTile(1, 4, 4, 2, 3, lds_a=True, scale_b=True),
+        MfmaTile(1, 4, 1, 2, 3, lds_a=True, scale_b=True),
+        MfmaTile(1, 4, 2, 1, 3, lds_a=True, scale_b=True),
     ],
 )
 @pytest.mark.parametrize("num_splits", [1, 2, 3, 8])
@@ -120,6 +122,19 @@ def test_m64_tile_k_starved(shape_n, shape_k, tiles_m):
         tile = gfx950.select_tile(shape_m, shape_n, shape_k, 256, False, 4)
         assert (tile.tiles_m, tile.tiles_n) == (tiles_m, 2)
         mirror, _ = select_tile(shape_m, shape_n, shape_k, 4, 256)
+        assert dataclasses.asdict(mirror) == dataclasses.asdict(tile)
+
+
+@pytest.mark.parametrize("shape_n,narrow", [(4096, True), (6144, True), (8192, False), (57344, False)])
+def test_small_m_tiles(shape_n, narrow):
+    """M <= 16 uses 16-row blocks; M in (16, 32] uses 32 x 64 blocks for small N."""
+    for shape_m in (9, 12, 16):
+        tile = gfx950.select_tile(shape_m, shape_n, 4096, 256, False, 4)
+        assert (tile.tiles_m, tile.tiles_n, tile.lds_a) == (1, 2, True)
+    for shape_m in (17, 24, 32):
+        tile = gfx950.select_tile(shape_m, shape_n, 4096, 256, False, 4)
+        assert (tile.tiles_m, tile.tiles_n) == (2, 1 if narrow else 2)
+        mirror, _ = select_tile(shape_m, shape_n, 4096, 4, 256)
         assert dataclasses.asdict(mirror) == dataclasses.asdict(tile)
 
 

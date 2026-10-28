@@ -88,10 +88,11 @@ def test_wide_tile(dtype, num_bits, group_size, has_zero_point, shape_m):
     assert rel < TOLERANCE[dtype]
 
 
+@pytest.mark.parametrize("shape_k", [4096, 14336])
 @pytest.mark.parametrize("num_bits", [1, 4, 5, 8])
 @pytest.mark.parametrize("is_bfloat16", [False, True])
 @pytest.mark.parametrize("shape_n", [1024, 4096, 8192, 28672, 57344, 131072])
-def test_tile_buckets(is_bfloat16, shape_n, num_bits):
+def test_tile_buckets(is_bfloat16, shape_n, num_bits, shape_k):
     """Each M interval of the tuner maps to one tile, and the test mirror agrees with it."""
     num_cus = 256
     intervals = gfx950.get_m_intervals(shape_n, num_cus, is_bfloat16, num_bits)
@@ -100,13 +101,26 @@ def test_tile_buckets(is_bfloat16, shape_n, num_bits):
         assert high == low
     for low, high in intervals:
         probes = {low + 1, min(high, low + 129), min(high, 1 << 16)}
-        tiles = {gfx950.select_tile(m, shape_n, num_cus, is_bfloat16, num_bits) for m in probes}
+        tiles = {gfx950.select_tile(m, shape_n, shape_k, num_cus, is_bfloat16, num_bits) for m in probes}
         assert len(tiles) == 1, (low, high, tiles)
         for m in probes:
-            mirror, _ = select_tile(m, shape_n, 4096, num_bits, num_cus, is_bfloat16)
+            mirror, _ = select_tile(m, shape_n, shape_k, num_bits, num_cus, is_bfloat16)
             assert dataclasses.asdict(mirror) == dataclasses.asdict(next(iter(tiles)))
-    wide = gfx950.select_tile(1 << 16, shape_n, num_cus, is_bfloat16, num_bits)
+    wide = gfx950.select_tile(1 << 16, shape_n, shape_k, num_cus, is_bfloat16, num_bits)
     assert wide.tiles_n == (4 if not is_bfloat16 and num_bits <= 4 else 2)
+
+
+@pytest.mark.parametrize(
+    "shape_n,shape_k,tiles_m",
+    [(4096, 4096, 2), (6144, 4096, 2), (5120, 5120, 2), (4096, 14336, 4), (8192, 8192, 4), (28672, 4096, 4)],
+)
+def test_m64_tile_k_starved(shape_n, shape_k, tiles_m):
+    """M in (32, 64] falls back to the 32x128 tile when the 64x128 grid has < 8 K chunks per split."""
+    for shape_m in (33, 48, 64):
+        tile = gfx950.select_tile(shape_m, shape_n, shape_k, 256, False, 4)
+        assert (tile.tiles_m, tile.tiles_n) == (tiles_m, 2)
+        mirror, _ = select_tile(shape_m, shape_n, shape_k, 4, 256)
+        assert dataclasses.asdict(mirror) == dataclasses.asdict(tile)
 
 
 @pytest.mark.parametrize("num_bits", [2, 4, 5, 8])

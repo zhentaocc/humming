@@ -63,15 +63,29 @@ def wide_tile_min_m(shape_n: int, num_cus: int) -> int:
     return max(64, 128 * (m_blocks - 1))
 
 
-def select_tile(shape_m: int, shape_n: int, num_cus: int, is_bfloat16: bool, num_bits: int) -> MfmaTile:
+# M in (32, 64]: the 64 x 128 tile, unless split-K leaves it K-starved (fewer than
+# MIN_CHUNKS_PER_SPLIT chunks of 128 per split); then the 32 x 128 tile (twice the blocks, half
+# the splits) is 5-17% faster (small N and K, e.g. 4096x4096, 5120x5120, 6144x4096).
+MIN_CHUNKS_PER_SPLIT = 8
+TILE_M64 = MfmaTile(tiles_m=4, tiles_n=2, stages=3, lds_a=True, scale_b=True)
+TILE_M32 = MfmaTile(tiles_m=2, tiles_n=2, stages=3, lds_a=True, scale_b=True)
+
+
+def is_k_starved(tile: MfmaTile, shape_m: int, shape_n: int, shape_k: int, num_cus: int) -> bool:
+    num_splits = get_num_splits(tile, shape_m, shape_n, shape_k, num_cus)
+    return shape_k // CHUNK_K // num_splits < MIN_CHUNKS_PER_SPLIT
+
+
+def select_tile(shape_m: int, shape_n: int, shape_k: int, num_cus: int, is_bfloat16: bool, num_bits: int) -> MfmaTile:
     if shape_m <= 8:
         # Decode: no LDS, one 16-row MFMA tile; wider N per wave only when N gives enough blocks.
         tiles_n = 2 if shape_n // 128 >= num_cus // 2 else 1
         return MfmaTile(tiles_m=1, tiles_n=tiles_n, stages=4)
     if shape_m <= 32:
-        return MfmaTile(tiles_m=2, tiles_n=2, stages=3, lds_a=True, scale_b=True)
+        return TILE_M32
     if shape_m <= 64:
-        return MfmaTile(tiles_m=4, tiles_n=2, stages=3, lds_a=True, scale_b=True)
+        # 64 rows: one block row for every M in the bucket, so the choice is M-independent.
+        return TILE_M32 if is_k_starved(TILE_M64, 64, shape_n, shape_k, num_cus) else TILE_M64
     if wide_tile_allowed(is_bfloat16, num_bits) and shape_m > wide_tile_min_m(shape_n, num_cus):
         return MfmaTile(tiles_m=8, tiles_n=4, stages=2, lds_a=True, scale_b=True)
     return MfmaTile(tiles_m=8, tiles_n=2, stages=2, lds_a=True, scale_b=True)
@@ -125,7 +139,8 @@ class Gfx950Heuristics(DeviceHeuristics):
         cls._check(layer_config, gemm_type)
         is_bfloat16 = layer_config.a_dtype == dtypes.bfloat16
         num_bits = layer_config.b_dtype.num_bits
-        return select_tile(shape_m, layer_config.shape_n, cls.num_cus(), is_bfloat16, num_bits).to_tuning_config()
+        shape_n, shape_k = layer_config.shape_n, layer_config.shape_k
+        return select_tile(shape_m, shape_n, shape_k, cls.num_cus(), is_bfloat16, num_bits).to_tuning_config()
 
     @classmethod
     def get_configs(cls, layer_config: LayerConfig, gemm_type=GemmType.DENSE, **kwargs) -> list:

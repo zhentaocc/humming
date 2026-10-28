@@ -115,10 +115,17 @@ def select_tile(
         tile = MfmaTile(warps_m=1, warps_n=4, tiles_m=2, tiles_n=2, stages=3, lds_a=True, scale_b=True)
     elif shape_m <= 64:
         tile = MfmaTile(warps_m=1, warps_n=4, tiles_m=4, tiles_n=2, stages=3, lds_a=True, scale_b=True)
+        # K-starved 64x128 grid (< 8 chunks of 128 per split): the 32x128 tile is faster.
+        if shape_k // 128 // _num_splits(tile, 64, shape_n, shape_k, num_cus) < 8:
+            tile = MfmaTile(warps_m=1, warps_n=4, tiles_m=2, tiles_n=2, stages=3, lds_a=True, scale_b=True)
     elif gfx950.wide_tile_allowed(is_bfloat16, num_bits) and shape_m > gfx950.wide_tile_min_m(shape_n, num_cus):
         tile = MfmaTile(warps_m=1, warps_n=4, tiles_m=8, tiles_n=4, stages=2, lds_a=True, scale_b=True)
     else:
         tile = MfmaTile(warps_m=1, warps_n=4, tiles_m=8, tiles_n=2, stages=2, lds_a=True, scale_b=True)
+    return tile, _num_splits(tile, shape_m, shape_n, shape_k, num_cus)
+
+
+def _num_splits(tile: MfmaTile, shape_m: int, shape_n: int, shape_k: int, num_cus: int) -> int:
     num_blocks = math.ceil(shape_n / tile.block_n) * math.ceil(shape_m / tile.block_m)
     num_chunks_k = shape_k // 128
     # Split-K until about one block per CU (the kernel needs >= 1 wave per SIMD to keep
@@ -126,7 +133,7 @@ def select_tile(
     num_splits = 1
     while num_blocks * num_splits < num_cus and num_splits < 8 and num_chunks_k // (num_splits * 2) >= 4:
         num_splits *= 2
-    return tile, num_splits
+    return num_splits
 
 
 def mfma_gemm(

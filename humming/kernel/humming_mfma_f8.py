@@ -479,12 +479,18 @@ def select_f8_tile(shape_m: int, shape_n: int, num_cus: int, plan: MfmaF8Plan) -
             tile = MfmaTile(warps_m=2, warps_n=2, tiles_m=4, tiles_n=4, stages=2, lds_a=True)
     else:
         blocks_128x64 = math.ceil(shape_n / 64) * math.ceil(shape_m / 128)
+        native_flush = plan.b_mode == B_NATIVE and plan.scale_k > 0
         if blocks_128x64 < num_cus:
             tile = MfmaTile(tiles_m=4, tiles_n=1, stages=3, lds_a=True)
+        elif native_flush:
+            # Native B with FP32 group / block scales (e.g. FP8 128 x 128 blocks): the per-stage
+            # activation-scale registers make 128-row tiles spill; 64 x 128 tiles do not.
+            tile = MfmaTile(tiles_m=4, tiles_n=2, stages=2, lds_a=True)
         elif blocks_128x64 < 4 * num_cus:
             tile = MfmaTile(tiles_m=8, tiles_n=1, stages=2, lds_a=True)
         else:
-            tile = MfmaTile(tiles_m=8, tiles_n=2, stages=2 if plan.b_mode == B_LUT else 3, lds_a=True)
+            # Dequantized B (table / INT arithmetic) needs the registers of the third stage.
+            tile = MfmaTile(tiles_m=8, tiles_n=2, stages=3 if plan.b_mode == B_NATIVE else 2, lds_a=True)
     row_units = 4 if fp4_a else 8
     threads = tile.warps_m * tile.warps_n * 64
     if tile.block_m * row_units % threads:

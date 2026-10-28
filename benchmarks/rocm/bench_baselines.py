@@ -233,6 +233,9 @@ def main():
     ap.add_argument("--quick", action="store_true", help="2 shapes x M in {1,16,1024}, fp16 only")
     ap.add_argument("--out-dir", default=os.path.join(_HERE, "results"))
     ap.add_argument("--tag", default=datetime.date.today().isoformat())
+    ap.add_argument("--prefix", default="baselines", help="output file prefix: <prefix>_<tag>.{csv,md}")
+    ap.add_argument("--windows", type=int, default=1,
+                    help="timing windows per point; the best (min) is kept (noisy shared node)")
     args = ap.parse_args()
     if args.quick:
         args.shapes = ["llama3-8b/o_proj", "llama3-70b/gate_up"]
@@ -240,7 +243,7 @@ def main():
         args.dtypes = ["fp16"]
 
     os.makedirs(args.out_dir, exist_ok=True)
-    base = os.path.join(args.out_dir, f"baselines_{args.tag}")
+    base = os.path.join(args.out_dir, f"{args.prefix}_{args.tag}")
     csv_path, md_path = base + ".csv", base + ".md"
 
     dev = torch.cuda.get_device_properties(0)
@@ -269,7 +272,7 @@ def main():
         dtype = DTYPES[c.dtype]
         key = fmt_bytes_cfg(c)
         try:
-            ok, err, msg = check_correctness(spec, dtype, max(c.bits, 4) if c.bits != 16 else 4, args.group_size, c.zp)
+            ok, err, msg = check_correctness(spec, dtype, c.bits if c.bits != 16 else 4, args.group_size, c.zp)
         except Unsupported as e:
             ok, msg = False, f"unsupported: {e}"
         except Exception as e:
@@ -304,7 +307,8 @@ def main():
                             s.pop("w_ref", None)
                             s.pop("x_ref", None)
                         states.append(s)
-                    us, mode = time_run(run, states, args.warmup, args.iters, args.timing)
+                    timings = [time_run(run, states, args.warmup, args.iters, args.timing) for _ in range(args.windows)]
+                    us, mode = min(timings)
                     sd = s0 if isinstance(s0, dict) else {}
                     wb = sd.get("weight_bytes") or nominal_weight_bytes(N, K, c.bits, args.group_size, c.zp)
                     ab = sd.get("act_bytes") or M * K * 2
@@ -356,7 +360,8 @@ def write_markdown(path, env, probe, status, rows, args):
         L.append(f"| measured: {k} | {v:.2f} |")
     L.append("\n## Methodology\n")
     L.append(f"- HIP-event timing; warmup >= {args.warmup}; >= {args.iters} timed calls; calls captured into a "
-             "HIP graph (no host launch overhead) unless the `timing` column says eager.")
+             "HIP graph (no host launch overhead) unless the `timing` column says eager. "
+             f"Best of {args.windows} timing window(s) per point.")
     L.append(f"- L2/MALL defeat: rotating buffers. Each config builds n_copies independent (X, packed W, scales, "
              f"zeros, workspace) sets so the cyclic footprint is >= {args.flush_bytes / 2**20:.0f} MiB "
              "(4x the 256 MB MALL, capped at "

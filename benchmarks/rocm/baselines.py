@@ -1,9 +1,8 @@
 """Registered ROCm baseline implementations.
 
 Every entry follows ``factory(M, N, K, dtype, bits, group_size, zp) -> (setup, run)``
-(see ``common.py``). To add the Humming ROCm kernel, add one more
-``@register(...)`` function here (or in any module imported by
-``bench_baselines.py``).
+(see ``common.py``). Humming itself is registered last as ``humming`` and runs through
+its public ``HummingLayer`` API.
 """
 
 from __future__ import annotations
@@ -563,5 +562,67 @@ def aiter_gemm_a4w4_asm(M, N, K, dtype, bits, group_size, zp):
 
     def run(s):
         return aiter.gemm_a4w4(s["x"], s["w"], s["xs"], s["ws"], dtype=dtype, bpreshuffle=True)
+
+    return setup, run
+
+
+# ==========================================================================
+# 8. Humming (this repo) through its public API: HummingLayer.load_from_tensors
+#    -> transform() -> layer(x), i.e. the gfx950 MFMA GEMM behind humming_forward.
+# ==========================================================================
+_REPO_ROOT = os.path.dirname(os.path.dirname(_HERE))
+_HUMMING_LAYER_CACHE: dict = {}
+
+
+@register(
+    "humming",
+    kind="wNa16",
+    bits=(1, 2, 3, 4, 5, 6, 7, 8),
+    source=f"humming@{_git_rev(_REPO_ROOT)} HummingLayer (gfx950 MFMA GEMM, humming/kernel/humming_mfma.cuh)",
+)
+def humming_layer(M, N, K, dtype, bits, group_size, zp):
+    import copy
+    import sys
+
+    if _REPO_ROOT not in sys.path:
+        sys.path.insert(0, _REPO_ROOT)
+    from humming import ops as humming_ops
+    from humming.layer import HummingLayer
+
+    if K % group_size or group_size % 32:
+        raise Unsupported(f"group_size {group_size}")
+
+    def build(p: Problem):
+        weight_config = {"dtype": f"uint{bits}" if zp else f"int{bits}", "has_zero_point": zp}
+        if group_size != K:
+            weight_config["group_size"] = group_size
+        layer = HummingLayer(shape_n=N, shape_k=K, weight_config=weight_config, torch_dtype=dtype).cuda()
+        tensors = {
+            "weight": humming_ops.pack_weight(p.q.contiguous(), bits),
+            "weight_scale": p.scales.contiguous() if group_size != K else p.scales.reshape(N, 1).contiguous(),
+        }
+        if zp:  # Humming packs zero points along N: [N * bits / 32, groups]
+            zeros = p.zeros.t().contiguous()
+            tensors["zero_point"] = humming_ops.pack_weight(zeros, bits).t().contiguous()
+        layer.load_from_tensors(tensors)
+        layer.transform()
+        return layer
+
+    def setup(p: Problem):
+        # The harness slices one Problem per shape for every M: transform once per weight, then the
+        # rotating copies (and the other M values) deep-copy the transformed layer.
+        key = (p.q.data_ptr(), p.scales.data_ptr(), p.zeros.data_ptr(), N, K, bits, group_size, zp, dtype)
+        if _HUMMING_LAYER_CACHE.get("key") != key:
+            _HUMMING_LAYER_CACHE.clear()
+            _HUMMING_LAYER_CACHE.update(key=key, layer=build(p))
+            torch.cuda.empty_cache()
+        layer = copy.deepcopy(_HUMMING_LAYER_CACHE["layer"])
+        params = dict(layer.named_parameters())
+        state = {"x": p.fresh_x(), "layer": layer, **params}
+        state["weight_bytes"] = sum(t.numel() * t.element_size() for t in params.values())
+        return state
+
+    def run(s):
+        return s["layer"](s["x"])
 
     return setup, run

@@ -11,6 +11,7 @@ GEMM. Everything else raises ``NotImplementedError``.
 """
 
 import dataclasses
+import functools
 import json
 from typing import ClassVar
 
@@ -210,5 +211,10 @@ def prepare_mfma_kernels(layer_config, compute_config, tuning_config, device=Non
 @torch.compiler.assume_constant_result
 def get_mfma_gemm_meta(layer_config: str) -> tuple[int, int, int]:
     """``(padded shape_n, pad_shape_n, pad_shape_k)`` of a ROCm layer config string."""
+    return _parse_mfma_gemm_meta(layer_config)
+
+
+@functools.lru_cache(maxsize=1024)
+def _parse_mfma_gemm_meta(layer_config: str) -> tuple[int, int, int]:
     layer_obj = json.loads(layer_config)
     return int(layer_obj["shape_n"]), int(layer_obj.get("pad_shape_n", 0)), int(layer_obj.get("pad_shape_k", 0))

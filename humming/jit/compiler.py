@@ -325,7 +325,7 @@ class NVCCCompiler(Compiler):
 
 
 class HIPCCCompiler(Compiler):
-    """Compile a kernel source to a ROCm code object (``.hsaco``) with ``hipcc --genco``.
+    """Compile a kernel source to a raw ROCm code object (``.hsaco``, an AMDGPU ELF) with hipcc.
 
     ``sm_version`` carries the GCN target (``"gfx950"``) on ROCm. The output keeps the
     ``kernel.cubin`` cache file name so callers stay platform agnostic.
@@ -343,7 +343,9 @@ class HIPCCCompiler(Compiler):
         flags = [
             "-x",
             "hip",
-            "--genco",
+            # Raw device ELF; --genco alone wraps it in a clang offload bundle.
+            "--cuda-device-only",
+            "--no-gpu-bundle-output",
             f"--offload-arch={sm_version}",
             "-std=c++17",
             "-O3",

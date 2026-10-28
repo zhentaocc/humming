@@ -1,7 +1,10 @@
 #pragma once
 
+#include <humming/utils/platform.cuh>
+#ifndef HUMMING_HIP
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#endif
 
 #include <humming/utils/all.cuh>
 

@@ -195,6 +195,11 @@ class Gfx950Heuristics(DeviceHeuristics):
     def get_config(cls, layer_config: LayerConfig, shape_m: int, gemm_type=GemmType.DENSE, **kwargs) -> dict:
         if cls._check(layer_config, gemm_type) != GemmType.DENSE:
             return select_moe_tile(shape_m, layer_config.num_experts).to_moe_tuning_config()
+        if layer_config.a_dtype.num_bits < 16:
+            from humming.kernel.humming_mfma_f8 import plan_mfma_f8, select_f8_tile
+
+            plan = plan_mfma_f8(layer_config)
+            return select_f8_tile(shape_m, layer_config.shape_n, cls.num_cus(), plan).to_tuning_config()
         is_bfloat16 = layer_config.a_dtype == dtypes.bfloat16
         num_bits = layer_config.b_dtype.num_bits
         shape_n, shape_k = layer_config.shape_n, layer_config.shape_k
@@ -207,6 +212,9 @@ class Gfx950Heuristics(DeviceHeuristics):
                 [low, high, select_moe_tile(high, layer_config.num_experts).to_moe_tuning_config()]
                 for low, high in moe_m_intervals(layer_config.num_experts)
             ]
-        is_bfloat16 = layer_config.a_dtype == dtypes.bfloat16
-        intervals = get_m_intervals(layer_config.shape_n, cls.num_cus(), is_bfloat16, layer_config.b_dtype.num_bits)
+        if layer_config.a_dtype.num_bits < 16:
+            from humming.kernel.humming_mfma_f8 import F8_M_INTERVALS as intervals
+        else:
+            is_bfloat16 = layer_config.a_dtype == dtypes.bfloat16
+            intervals = get_m_intervals(layer_config.shape_n, cls.num_cus(), is_bfloat16, layer_config.b_dtype.num_bits)
         return [[low, high, cls.get_config(layer_config, high, gemm_type)] for low, high in intervals]

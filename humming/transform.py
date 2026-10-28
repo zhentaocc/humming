@@ -712,6 +712,10 @@ def transform_mfma_tensors(config: LayerConfig, tensors: dict[str, torch.Tensor]
     from humming.rocm import layout
 
     check_mfma_layer_config(config)
+    if config.a_dtype.num_bits < 16:
+        from humming.kernel.humming_mfma_f8 import transform_mfma_f8_tensors
+
+        return transform_mfma_f8_tensors(config, tensors)
     num_bits = config.b_dtype.num_bits
     a_dtype = dtypes.torch_dtype_map[config.a_dtype]
 

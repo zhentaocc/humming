@@ -566,6 +566,262 @@ def aiter_gemm_a4w4_asm(M, N, K, dtype, bits, group_size, zp):
     return setup, run
 
 
+@register(
+    "aiter_a8w8_fp8",
+    kind="w8a8",
+    bits=(8,),
+    source=f"aiter@{AITER_REV} ops/triton/gemm/basic/gemm_a8w8.py FP8-e4m3 per-token X / per-channel W, X quant not timed",
+)
+def aiter_a8w8_fp8(M, N, K, dtype, bits, group_size, zp):
+    from aiter.ops.triton.gemm.basic.gemm_a8w8 import gemm_a8w8
+
+    if zp:
+        raise Unsupported("fp8: no zero point")
+
+    def setup(p: Problem):
+        wq, ws = _rowwise_fp8(p.w_dequant(torch.float32))
+        xq, xs = _rowwise_fp8(p.x)
+        return {
+            "x": xq,
+            "xs": xs.contiguous(),
+            "w": wq,
+            "ws": ws.t().contiguous(),
+            "w_ref": wq.float() * ws,
+            "x_ref": xq.float() * xs,
+            "weight_bytes": N * K + N * 4,
+            "act_bytes": M * K + M * 4,
+        }
+
+    def run(s):
+        return gemm_a8w8(s["x"], s["w"], s["xs"], s["ws"], dtype=dtype)
+
+    return setup, run
+
+
+@register(
+    "aiter_a8w8_fp8_ck",
+    kind="w8a8",
+    bits=(8,),
+    source=f"aiter@{AITER_REV} ops/gemm_op_a8w8.py gemm_a8w8_CK (CK, FP8-e4m3 per-token X / per-channel W, tuned-config lookup), X quant not timed",
+)
+def aiter_a8w8_fp8_ck(M, N, K, dtype, bits, group_size, zp):
+    from aiter.ops.gemm_op_a8w8 import gemm_a8w8_CK
+
+    if zp:
+        raise Unsupported("fp8: no zero point")
+
+    def setup(p: Problem):
+        wq, ws = _rowwise_fp8(p.w_dequant(torch.float32))
+        xq, xs = _rowwise_fp8(p.x)
+        return {
+            "x": xq,
+            "xs": xs.contiguous(),
+            "w": wq,
+            "ws": ws.t().contiguous(),
+            "w_ref": wq.float() * ws,
+            "x_ref": xq.float() * xs,
+            "weight_bytes": N * K + N * 4,
+            "act_bytes": M * K + M * 4,
+        }
+
+    def run(s):
+        return gemm_a8w8_CK(s["x"], s["w"], s["xs"], s["ws"], dtype=dtype)
+
+    return setup, run
+
+
+def _block128_fp8(w: torch.Tensor):
+    """FP8 weight with one FP32 scale per 128 x 128 block -> (wq [N, K], scale [N/128, K/128], w_ref)."""
+    N, K = w.shape
+    wb = w.float().view(N // 128, 128, K // 128, 128)
+    scale = wb.abs().amax(dim=(1, 3), keepdim=True).clamp_min(1e-12) / torch.finfo(_fp8_dtype()).max
+    wq = (wb / scale).to(_fp8_dtype())
+    return wq.view(N, K).contiguous(), scale.view(N // 128, K // 128).contiguous(), (wq.float() * scale).view(N, K)
+
+
+def _group128_fp8(x: torch.Tensor):
+    """FP8 activation with one FP32 scale per row and 128-wide K group -> (xq, scale [M, K/128], x_ref)."""
+    M, K = x.shape
+    xg = x.float().view(M, K // 128, 128)
+    scale = xg.abs().amax(dim=2, keepdim=True).clamp_min(1e-12) / torch.finfo(_fp8_dtype()).max
+    xq = (xg / scale).to(_fp8_dtype())
+    return xq.view(M, K).contiguous(), scale.view(M, K // 128).contiguous(), (xq.float() * scale).view(M, K)
+
+
+def _blockscale_factory(run_fn):
+    def setup(p: Problem):
+        wq, ws, w_ref = _block128_fp8(p.w_dequant(torch.float32))
+        xq, xs, x_ref = _group128_fp8(p.x)
+        N, K = wq.shape
+        return {
+            "x": xq,
+            "xs": xs,
+            "w": wq,
+            "ws": ws,
+            "w_ref": w_ref,
+            "x_ref": x_ref,
+            "weight_bytes": N * K + (N // 128) * (K // 128) * 4,
+            "act_bytes": xq.numel() + xs.numel() * 4,
+        }
+
+    return setup, run_fn
+
+
+@register(
+    "aiter_a8w8_blockscale_fp8",
+    kind="w8a8",
+    bits=(8,),
+    source=f"aiter@{AITER_REV} ops/triton/gemm/basic/gemm_a8w8_blockscale.py FP8 X 1x128 / W 128x128 scales, X quant "
+    "not timed; M = 1 runs as M = 2 (zero row) with the M=16 config: Triton's M==1 specialization of this kernel "
+    "crashes TritonAMDGPUCanonicalizePointers",
+)
+def aiter_a8w8_blockscale_fp8(M, N, K, dtype, bits, group_size, zp):
+    from aiter.ops.triton.gemm.basic import gemm_a8w8_blockscale as mod
+
+    if zp:
+        raise Unsupported("fp8: no zero point")
+    if N % 128 or K % 128:
+        raise Unsupported("needs N, K multiple of 128")
+    backend = "gluon" if mod._is_gluon_available() else "triton"
+    config, _ = mod._get_config(max(M, 16), N, K, backend=backend)
+    setup0, _ = _blockscale_factory(None)
+
+    def setup(p: Problem):
+        s = setup0(p)
+        if M == 1:  # pad to two rows; the timed kernel reads one extra (zero) row
+            s["x_pad"] = torch.cat([s["x"], torch.zeros_like(s["x"])])
+            s["xs_pad"] = torch.cat([s["xs"], torch.ones_like(s["xs"])])
+        return s
+
+    def run(s):
+        if M == 1:
+            y = mod.gemm_a8w8_blockscale(s["x_pad"], s["w"], s["xs_pad"], s["ws"], dtype=dtype, config=dict(config),
+                                         backend=backend)
+            return y[:1]
+        return mod.gemm_a8w8_blockscale(s["x"], s["w"], s["xs"], s["ws"], dtype=dtype, config=dict(config),
+                                        backend=backend)
+
+    return setup, run
+
+
+@register(
+    "aiter_a8w8_blockscale_fp8_ck",
+    kind="w8a8",
+    bits=(8,),
+    source=f"aiter@{AITER_REV} ops/gemm_op_a8w8.py gemm_a8w8_blockscale (CK / CK-tile per tuned config) FP8 X 1x128 / W 128x128, X quant not timed",
+)
+def aiter_a8w8_blockscale_fp8_ck(M, N, K, dtype, bits, group_size, zp):
+    from aiter.ops.gemm_op_a8w8 import _hip_blockscale_supported, gemm_a8w8_blockscale
+
+    if zp:
+        raise Unsupported("fp8: no zero point")
+    if N % 128 or K % 128:
+        raise Unsupported("needs N, K multiple of 128")
+    if not _hip_blockscale_supported():
+        raise Unsupported("no CK blockscale code object for this arch (would fall back to triton)")
+    return _blockscale_factory(lambda s: gemm_a8w8_blockscale(s["x"], s["w"], s["xs"], s["ws"], dtype=dtype))
+
+
+@register(
+    "aiter_a8w8_fp8_bpreshuffle",
+    kind="w8a8",
+    bits=(8,),
+    source=f"aiter@{AITER_REV} ops/gemm_op_a8w8.py gemm_a8w8_bpreshuffle (CK / CK-tile / asm per tuned config, (16,16)-shuffled "
+    "FP8 W) per-token X / per-channel W, X quant not timed",
+)
+def aiter_a8w8_fp8_bpreshuffle(M, N, K, dtype, bits, group_size, zp):
+    from aiter.ops.gemm_op_a8w8 import gemm_a8w8_bpreshuffle
+    from aiter.ops.shuffle import shuffle_weight
+
+    if zp:
+        raise Unsupported("fp8: no zero point")
+
+    def setup(p: Problem):
+        wq, ws = _rowwise_fp8(p.w_dequant(torch.float32))
+        xq, xs = _rowwise_fp8(p.x)
+        return {
+            "x": xq,
+            "xs": xs.contiguous(),
+            "w": shuffle_weight(wq, layout=(16, 16)),
+            "ws": ws.t().contiguous(),
+            "w_ref": wq.float() * ws,
+            "x_ref": xq.float() * xs,
+            "weight_bytes": N * K + N * 4,
+            "act_bytes": M * K + M * 4,
+        }
+
+    def run(s):
+        return gemm_a8w8_bpreshuffle(s["x"], s["w"], s["xs"], s["ws"], dtype=dtype)
+
+    return setup, run
+
+
+@register(
+    "aiter_a8w8_blockscale_fp8_bpreshuffle",
+    kind="w8a8",
+    bits=(8,),
+    source=f"aiter@{AITER_REV} ops/gemm_op_a8w8.py gemm_a8w8_blockscale_bpreshuffle (CK / asm per tuned config, "
+    "(16,16)-shuffled W, column-major X scales) FP8 X 1x128 / W 128x128, X quant not timed",
+)
+def aiter_a8w8_blockscale_fp8_bpreshuffle(M, N, K, dtype, bits, group_size, zp):
+    from aiter.ops.gemm_op_a8w8 import _hip_blockscale_supported, gemm_a8w8_blockscale_bpreshuffle
+    from aiter.ops.shuffle import shuffle_weight
+
+    if zp:
+        raise Unsupported("fp8: no zero point")
+    if N % 128 or K % 128:
+        raise Unsupported("needs N, K multiple of 128")
+    if not _hip_blockscale_supported():
+        raise Unsupported("no CK blockscale code object for this arch")
+    setup0, _ = _blockscale_factory(None)
+
+    def setup(p: Problem):
+        s = setup0(p)
+        s["w"] = shuffle_weight(s["w"], layout=(16, 16))
+        s["xs"] = s["xs"].t().contiguous().view(*s["xs"].shape)  # column-major [M, K/128]
+        return s
+
+    def run(s):
+        return gemm_a8w8_blockscale_bpreshuffle(s["x"], s["w"], s["xs"], s["ws"], dtype=dtype)
+
+    return setup, run
+
+
+@register(
+    "aiter_a8wfp4",
+    kind="w4a8",
+    bits=(4,),
+    source=f"aiter@{AITER_REV} ops/triton/gemm/basic/gemm_a8wfp4.py FP8 per-token X x MXFP4 W, X quant not timed",
+    tol=3e-2,
+)
+def aiter_a8wfp4(M, N, K, dtype, bits, group_size, zp):
+    from aiter.ops.triton.gemm.basic.gemm_a8wfp4 import gemm_a8wfp4
+
+    if zp:
+        raise Unsupported("MXFP4: no zero point")
+
+    def setup(p: Problem):
+        wq, ws = _mxfp4_quant(p.w_dequant(torch.bfloat16))
+        xq, xs = _rowwise_fp8(p.x)
+        return {
+            "x": xq,
+            "xs": xs.contiguous(),
+            "w": wq,
+            "ws": ws,
+            "y": torch.empty(M, N, dtype=dtype, device="cuda"),
+            "w_ref": mxfp4_dequant(wq, ws),
+            "x_ref": xq.float() * xs,
+            "weight_bytes": N * K // 2 + N * K // 32,
+            "act_bytes": M * K + M * 4,
+        }
+
+    def run(s):
+        gemm_a8wfp4(s["x"], s["w"], s["y"], s["xs"], s["ws"], dtype=dtype)
+        return s["y"]
+
+    return setup, run
+
+
 # ==========================================================================
 # 8. Humming (this repo) through its public API: HummingLayer.load_from_tensors
 #    -> transform() -> layer(x), i.e. the gfx950 MFMA GEMM behind humming_forward.
@@ -626,3 +882,122 @@ def humming_layer(M, N, K, dtype, bits, group_size, zp):
         return s["layer"](s["x"])
 
     return setup, run
+
+
+# ==========================================================================
+# 9. Humming low-bit activation GEMM (gfx950, humming/kernel/humming_mfma_f8.cuh) through
+#    HummingLayer. The weight is re-quantized from the canonical problem by
+#    load_from_unquantized; the activation is quantized in setup with Humming's own
+#    may_quant_input and the timed call is the GEMM only: layer(q, input_scale=s).
+#    ``humming_w8a8_fp8_e2e`` times quantization + GEMM (layer(x)).
+# ==========================================================================
+_FP8_TOKEN = {"dtype": "float8e4m3"}
+_FP8_G128 = {"dtype": "float8e4m3", "group_size": 128}
+_INT8_TOKEN = {"dtype": "int8"}
+_MXFP4 = {"dtype": "float4e2m1", "group_size": 32, "scale_dtype": "float8e8m0"}
+_HUMMING_F8_CACHE: dict = {}
+
+
+def _humming_dequant_act(q: torch.Tensor, s: torch.Tensor, K: int) -> torch.Tensor:
+    """FP32 view of Humming's quantized activation (q, input_scale)."""
+    if q.dtype == torch.uint8:  # packed E2M1, low nibble first
+        lut = torch.tensor(_MXFP4_LUT, dtype=torch.float32, device=q.device)
+        qa = lut[torch.stack([q & 0xF, q >> 4], dim=-1).reshape(q.size(0), K).long()]
+    else:
+        qa = q.float()
+    if s.numel() == 1:
+        return qa * s.float()
+    if s.dtype in (torch.int32, torch.uint8, torch.float8_e8m0fnu):  # E8M0 bytes per row
+        e = s.contiguous().view(torch.uint8)[:, : K // 32].float()
+        return qa * torch.exp2(e - 127).repeat_interleave(K // e.size(1), dim=1)
+    if s.size(1) == 1:
+        return qa * s.float()
+    return qa * s.float()[:, : K // 128].repeat_interleave(128, dim=1)  # FP32 1x128 group scales
+
+
+def _humming_f8_factory(weight_config_fn, input_config, e2e=False):
+    def factory(M, N, K, dtype, bits, group_size, zp):
+        import copy
+        import sys
+
+        if _REPO_ROOT not in sys.path:
+            sys.path.insert(0, _REPO_ROOT)
+        from humming.forward import may_quant_input
+        from humming.layer import HummingLayer
+
+        weight_config = weight_config_fn(bits, group_size, zp, K)
+
+        def build(p: Problem):
+            layer = HummingLayer(shape_n=N, shape_k=K, weight_config=dict(weight_config), torch_dtype=dtype,
+                                 input_config=dict(input_config)).cuda()
+            layer.load_from_unquantized(p.w_dequant(dtype))
+            w_ref = layer.weight_schema.dequant_tensors(dict(layer.state_dict())).float()
+            layer.transform()
+            return layer, w_ref
+
+        def setup(p: Problem):
+            key = (p.q.data_ptr(), p.scales.data_ptr(), N, K, dtype, repr(weight_config), repr(input_config))
+            if _HUMMING_F8_CACHE.get("key") != key:
+                _HUMMING_F8_CACHE.clear()
+                layer, w_ref = build(p)
+                _HUMMING_F8_CACHE.update(key=key, layer=layer, w_ref=w_ref)
+                torch.cuda.empty_cache()
+            layer = copy.deepcopy(_HUMMING_F8_CACHE["layer"])
+            params = dict(layer.named_parameters())
+            x = p.fresh_x()
+            q, s = may_quant_input(layer.humming_config, x)
+            state = {"layer": layer, **params, "x": x, "q": q, "s": s,
+                     "w_ref": _HUMMING_F8_CACHE["w_ref"], "x_ref": _humming_dequant_act(q, s, K)}
+            state["weight_bytes"] = sum(t.numel() * t.element_size() for t in params.values())
+            state["act_bytes"] = q.numel() * q.element_size() + s.numel() * s.element_size()
+            return state
+
+        if e2e:
+            def run(s):
+                return s["layer"](s["x"])
+        else:
+            def run(s):
+                return s["layer"](s["q"], input_scale=s["s"])
+
+        return setup, run
+
+    return factory
+
+
+def _int_weight(bits, group_size, zp, K):
+    config = {"dtype": f"uint{bits}" if zp else f"int{bits}", "has_zero_point": zp}
+    if group_size != K:
+        config["group_size"] = group_size
+    return config
+
+
+def _no_zp(config):
+    def fn(bits, group_size, zp, K):
+        if zp:
+            raise Unsupported("float / int8 weights: symmetric only")
+        return dict(config)
+
+    return fn
+
+
+_HUMMING_SRC = f"humming@{_git_rev(_REPO_ROOT)} HummingLayer, gfx950 low-bit MFMA GEMM (humming/kernel/humming_mfma_f8.cuh)"
+for _name, _kind, _bits, _wfn, _ic, _desc, _tol, _e2e in [
+    ("humming_w8a8_fp8", "w8a8", (8,), _no_zp({"dtype": "float8e4m3"}), _FP8_TOKEN,
+     "FP8 per-token X x FP8 per-channel W, X quant not timed", 2e-2, False),
+    ("humming_w8a8_fp8_e2e", "w8a8", (8,), _no_zp({"dtype": "float8e4m3"}), _FP8_TOKEN,
+     "FP8 per-token X x FP8 per-channel W, dynamic X quant timed", 2e-2, True),
+    ("humming_w8a8_fp8_block128", "w8a8", (8,), _no_zp({"dtype": "float8e4m3", "group_size": 128, "group_size_n": 128}),
+     _FP8_G128, "FP8 X 1x128 x FP8 W 128x128 block scales, X quant not timed", 2e-2, False),
+    ("humming_w4a8_int", "w4a8", (4,), _int_weight, _FP8_TOKEN,
+     "FP8 per-token X x INT4 (group G, optional zp) W dequantized to FP8, X quant not timed", 3e-2, False),
+    ("humming_w4a8_mxfp4", "w4a8", (4,), _no_zp(_MXFP4), _FP8_TOKEN,
+     "FP8 per-token X x MXFP4 W (scaled MFMA f8f6f4), X quant not timed", 3e-2, False),
+    ("humming_w4a4_mxfp4", "w4a4", (4,), _no_zp(_MXFP4), _MXFP4,
+     "MXFP4 X x MXFP4 W (scaled MFMA f8f6f4), X quant not timed", 3e-2, False),
+    ("humming_w8a8_int8", "w8a8", (8,), _no_zp({"dtype": "int8"}), _INT8_TOKEN,
+     "INT8 per-token X x INT8 per-channel W, X quant not timed", 2e-2, False),
+    ("humming_w4a8_int_i8", "w4a8", (4,), _int_weight, _INT8_TOKEN,
+     "INT8 per-token X x INT4 (group G, optional zp) W, X quant not timed", 3e-2, False),
+]:
+    register(_name, kind=_kind, bits=_bits, source=f"{_HUMMING_SRC}: {_desc}", tol=_tol)(
+        _humming_f8_factory(_wfn, _ic, e2e=_e2e))

@@ -104,7 +104,7 @@ def _get_workspace(device: torch.device, num_floats: int, num_counters: int) -> 
 
 
 def select_tile(
-    shape_m: int, shape_n: int, shape_k: int, num_cus: int = 256, is_bfloat16: bool = False
+    shape_m: int, shape_n: int, shape_k: int, num_bits: int, num_cus: int = 256, is_bfloat16: bool = False
 ) -> tuple[MfmaTile, int]:
     """Heuristic tile + split-K selection per M bucket (mirrors humming/tune/gfx950.py)."""
     if shape_m <= 8:
@@ -115,7 +115,7 @@ def select_tile(
         tile = MfmaTile(warps_m=1, warps_n=4, tiles_m=2, tiles_n=2, stages=3, lds_a=True, scale_b=True)
     elif shape_m <= 64:
         tile = MfmaTile(warps_m=1, warps_n=4, tiles_m=4, tiles_n=2, stages=3, lds_a=True, scale_b=True)
-    elif not is_bfloat16 and shape_m > gfx950.wide_tile_min_m(shape_n, num_cus):
+    elif gfx950.wide_tile_allowed(is_bfloat16, num_bits) and shape_m > gfx950.wide_tile_min_m(shape_n, num_cus):
         tile = MfmaTile(warps_m=1, warps_n=4, tiles_m=8, tiles_n=4, stages=2, lds_a=True, scale_b=True)
     else:
         tile = MfmaTile(warps_m=1, warps_n=4, tiles_m=8, tiles_n=2, stages=2, lds_a=True, scale_b=True)
@@ -153,7 +153,9 @@ def mfma_gemm(
         group_size = 0
     assert weight_scale.dtype == inputs.dtype
 
-    selected_tile, selected_splits = select_tile(shape_m, shape_n, shape_k, is_bfloat16=inputs.dtype == torch.bfloat16)
+    selected_tile, selected_splits = select_tile(
+        shape_m, shape_n, shape_k, num_bits, is_bfloat16=inputs.dtype == torch.bfloat16
+    )
     tile = tile or selected_tile
     num_splits = num_splits or selected_splits
     if outputs is None:

@@ -5,6 +5,8 @@ import dataclasses
 import pytest
 import torch
 
+from humming import dtypes
+from humming.config import GemmType, LayerConfig
 from humming.tune import gfx950
 from tests.rocm.mfma_gemm import MfmaTile, mfma_gemm, select_tile
 from tests.rocm.quant_utils import TOLERANCE, error_stats, make_quantized_linear
@@ -86,24 +88,47 @@ def test_wide_tile(dtype, num_bits, group_size, has_zero_point, shape_m):
     assert rel < TOLERANCE[dtype]
 
 
+@pytest.mark.parametrize("num_bits", [1, 4, 5, 8])
 @pytest.mark.parametrize("is_bfloat16", [False, True])
 @pytest.mark.parametrize("shape_n", [1024, 4096, 8192, 28672, 57344, 131072])
-def test_tile_buckets(is_bfloat16, shape_n):
+def test_tile_buckets(is_bfloat16, shape_n, num_bits):
     """Each M interval of the tuner maps to one tile, and the test mirror agrees with it."""
     num_cus = 256
-    intervals = gfx950.get_m_intervals(shape_n, num_cus, is_bfloat16)
+    intervals = gfx950.get_m_intervals(shape_n, num_cus, is_bfloat16, num_bits)
     assert intervals[0][0] == 0 and intervals[-1][1] == 1 << 30
     for (_, high), (low, _) in zip(intervals, intervals[1:]):
         assert high == low
     for low, high in intervals:
         probes = {low + 1, min(high, low + 129), min(high, 1 << 16)}
-        tiles = {gfx950.select_tile(m, shape_n, num_cus, is_bfloat16) for m in probes}
+        tiles = {gfx950.select_tile(m, shape_n, num_cus, is_bfloat16, num_bits) for m in probes}
         assert len(tiles) == 1, (low, high, tiles)
         for m in probes:
-            mirror, _ = select_tile(m, shape_n, 4096, num_cus, is_bfloat16)
+            mirror, _ = select_tile(m, shape_n, 4096, num_bits, num_cus, is_bfloat16)
             assert dataclasses.asdict(mirror) == dataclasses.asdict(next(iter(tiles)))
-    wide = gfx950.select_tile(1 << 16, shape_n, num_cus, is_bfloat16)
-    assert wide.tiles_n == (2 if is_bfloat16 else 4)
+    wide = gfx950.select_tile(1 << 16, shape_n, num_cus, is_bfloat16, num_bits)
+    assert wide.tiles_n == (4 if not is_bfloat16 and num_bits <= 4 else 2)
+
+
+@pytest.mark.parametrize("num_bits", [2, 4, 5, 8])
+@pytest.mark.parametrize("a_dtype", [dtypes.float16, dtypes.bfloat16])
+def test_heuristics_wide_tile_by_dtype(monkeypatch, a_dtype, num_bits):
+    """The layer tuner only picks the 128x256 tile for FP16 activations with <= 4-bit weights."""
+    monkeypatch.setattr(gfx950.Gfx950Heuristics, "num_cus", classmethod(lambda cls: 256))
+    layer_config = LayerConfig(
+        shape_n=28672,
+        shape_k=8192,
+        a_dtype=a_dtype,
+        b_dtype=dtypes.DataType.from_str(f"uint{num_bits}"),
+        c_dtype=a_dtype,
+        bs_dtype=a_dtype,
+        weight_scale_group_size=128,
+    )
+    configs = gfx950.Gfx950Heuristics.get_configs(layer_config, gemm_type=GemmType.DENSE)
+    tiles_n = {config["tiles_n"] for low, _, config in configs if low >= 64}
+    expect_wide = a_dtype == dtypes.float16 and num_bits <= 4
+    assert tiles_n == ({2, 4} if expect_wide else {2})
+    config = gfx950.Gfx950Heuristics.get_config(layer_config, 4096, gemm_type=GemmType.DENSE)
+    assert config["tiles_n"] == (4 if expect_wide else 2)
 
 
 def test_split_k_repeated_launches():

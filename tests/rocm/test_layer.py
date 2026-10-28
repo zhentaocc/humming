@@ -1,4 +1,7 @@
-"""HummingLayer on ROCm: integer weight-only layers run the MFMA GEMM; everything else raises."""
+"""HummingLayer on ROCm: integer weight-only layers run the MFMA GEMM; unsupported configs raise.
+
+8-bit / 4-bit activation layers are covered by test_layer_f8.py.
+"""
 
 import pytest
 import torch
@@ -11,8 +14,6 @@ SHAPE_K = 2048
 SUPPORTED_CASES = [{"dtype": "int4"}, {"dtype": "int8"}]
 UNSUPPORTED_CASES = [
     ({"dtype": "float8e4m3"}, None),
-    ({"dtype": "float4e2m1", "scale_dtype": "float8e8m0", "group_size": 32}, {"dtype": "float8e4m3"}),
-    ({"dtype": "int4"}, {"dtype": "int8"}),
     ({"dtype": "int4", "group_size": 16}, None),
 ]
 

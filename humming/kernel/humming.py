@@ -28,7 +28,7 @@ from humming.config.mma import (
     supports_undocumented_fp_dtypes,
     uses_undocumented_fp_operand,
 )
-from humming.device import current_device, get_device_index
+from humming.device import DeviceInfo, current_device, get_device_index
 from humming.jit.runtime import KernelRuntime
 from humming.tune import get_heuristics_config
 from humming.utils.smem import estimate_smem_size_config
@@ -693,6 +693,9 @@ class HummingKernel(KernelRuntime, LayerConfig, ComputeConfig, TuningConfig):
     @classmethod
     def _resolve_configs(cls, layer_config, compute_config, tuning_config, device=None):
         device_index = get_device_index(device)
+        if DeviceInfo(device_index).is_rocm:
+            # Everything up to here (quantization, transform, process_input) runs on ROCm.
+            raise NotImplementedError("MFMA GEMM backend not yet integrated")
         layer_obj = dict(cls._prepare_config_obj(layer_config))
         compute_obj = dict(cls._prepare_config_obj(compute_config))
         tuning_obj = cls._prepare_config_obj(tuning_config)

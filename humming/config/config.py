@@ -26,6 +26,9 @@ from humming.utils.math import ceil_div, round_up
 @functools.cache
 def _cuda_compiler_version(compiler_cls):
     version = compiler_cls.signature().split("+", 1)[1]
+    if version.startswith("rocm-"):
+        # hipcc: no CUDA-toolkit-version-gated feature applies.
+        return (0, 0)
     return tuple(int(x) for x in version.split(".")[:2])
 
 

@@ -18,6 +18,20 @@
 #include "./torch_api.h"
 #include "./utils.h"
 
+// Low-bit activation kernels (humming/kernel/humming_mfma_f8.cuh) export MFMA_F8_* symbols on top
+// of the MFMA_* ones and are launched by launch_mfma_f8_kernel (mfma_f8.h).
+struct MfmaF8Fields {
+  bool enabled = false;
+  uint32_t c_dtype_id = 0;
+  uint32_t a_pack = 1;  // K values per activation byte (2 for packed FP4)
+  bool is_int8 = false;
+  uint32_t ws_mode = 0;
+  uint32_t ws_group = 0;
+  uint32_t zp_group = 0;
+  uint32_t as_mode = 0;
+  uint32_t as_group = 0;
+};
+
 struct MfmaKernelData {
   uint32_t block_m;
   uint32_t block_n;
@@ -27,6 +41,7 @@ struct MfmaKernelData {
   uint32_t group_size;  // 0 = per-channel scale
   bool has_zero_point;
   uint32_t max_splits;
+  MfmaF8Fields f8{};
 };
 
 inline bool is_mfma_cubin(const CubinReader &reader) {
@@ -34,7 +49,7 @@ inline bool is_mfma_cubin(const CubinReader &reader) {
 }
 
 inline MfmaKernelData read_mfma_kernel_data(CubinReader &reader) {
-  return MfmaKernelData{
+  MfmaKernelData data{
       reader.getUint32("MFMA_BLOCK_M"),
       reader.getUint32("MFMA_BLOCK_N"),
       reader.getUint32("MFMA_NUM_THREADS"),
@@ -44,6 +59,18 @@ inline MfmaKernelData read_mfma_kernel_data(CubinReader &reader) {
       reader.getBool("MFMA_HAS_ZERO_POINT"),
       reader.getUint32("MFMA_MAX_SPLITS"),
   };
+  if (reader.hasSymbol("MFMA_F8_MODE")) {
+    data.f8.enabled = true;
+    data.f8.c_dtype_id = reader.getUint32("MFMA_F8_C_DTYPE_ID");
+    data.f8.a_pack = reader.getUint32("MFMA_F8_A_PACK");
+    data.f8.is_int8 = reader.getBool("MFMA_F8_IS_INT8");
+    data.f8.ws_mode = reader.getUint32("MFMA_F8_WS_MODE");
+    data.f8.ws_group = reader.getUint32("MFMA_F8_WS_GROUP");
+    data.f8.zp_group = reader.getUint32("MFMA_F8_ZP_GROUP");
+    data.f8.as_mode = reader.getUint32("MFMA_F8_AS_MODE");
+    data.f8.as_group = reader.getUint32("MFMA_F8_AS_GROUP");
+  }
+  return data;
 }
 
 // Split-K: keep doubling until about one block per CU, each split keeping >= 4 K chunks of 128.
@@ -122,6 +149,8 @@ inline void check_mfma_tensor(const Tensor &tensor, const char *name, int64_t de
                rows, ", ", cols, "]");
 }
 
+#include "./mfma_f8.h"
+
 inline Tensor launch_mfma_kernel(
     const MfmaKernelData &data,
     CUfunction func,
@@ -139,6 +168,10 @@ inline Tensor launch_mfma_kernel(
     const std::optional<Tensor> &expert_ids_,
     const std::optional<Tensor> &locks_,
     bool should_check_tensor) {
+  if (data.f8.enabled) {
+    return launch_mfma_f8_kernel(data, func, num_cus, a, b, bs, bs2_, as_, as2_, bzp_, bias_, c_, sorted_ids_,
+                                 expert_ids_, locks_, should_check_tensor);
+  }
   ASSERT_CHECK(!bs2_.has_value() && !as_.has_value() && !as2_.has_value(),
                "MFMA GEMM supports neither input scales nor secondary weight scales");
   ASSERT_CHECK(!bias_.has_value(), "MFMA GEMM has no bias epilogue; add the bias outside the kernel");

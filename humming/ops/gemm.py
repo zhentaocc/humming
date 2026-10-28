@@ -121,9 +121,10 @@ def _humming_gemm_rocm(*, layer_config: str, inputs: torch.Tensor, outputs: torc
 
     shape_n, pad_shape_n, pad_shape_k = get_mfma_gemm_meta(layer_config)
     if pad_shape_k:
-        inputs = torch.nn.functional.pad(inputs, (0, pad_shape_k))
+        inputs = _pad_rocm_inputs(inputs, pad_shape_k)
     if pad_shape_n:
-        padded_outputs = inputs.new_empty((inputs.size(0), shape_n))
+        _, output_dtype, _ = _get_humming_gemm_output_meta(layer_config, kwargs.get("compute_config"))
+        padded_outputs = inputs.new_empty((inputs.size(0), shape_n), dtype=output_dtype)
         padded_outputs = _humming_gemm(
             layer_config=layer_config, inputs=inputs, outputs=padded_outputs, bias=None, **kwargs
         )
@@ -138,6 +139,15 @@ def _humming_gemm_rocm(*, layer_config: str, inputs: torch.Tensor, outputs: torc
     if bias is not None:
         result.add_(bias)
     return result
+
+
+def _pad_rocm_inputs(inputs: torch.Tensor, pad_shape_k: int) -> torch.Tensor:
+    """Zero-pad K. FP8 / INT8 / packed FP4 (uint8, two values per byte) inputs are padded as bytes."""
+    if inputs.dtype in (torch.float16, torch.bfloat16, torch.float32):
+        return torch.nn.functional.pad(inputs, (0, pad_shape_k))
+    pad_bytes = pad_shape_k // 2 if inputs.dtype == torch.uint8 else pad_shape_k
+    padded = torch.nn.functional.pad(inputs.view(torch.uint8), (0, pad_bytes))
+    return padded.view(inputs.dtype)
 
 
 def _humming_gemm(

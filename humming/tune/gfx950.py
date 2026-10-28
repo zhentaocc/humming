@@ -90,6 +90,11 @@ class Gfx950Heuristics(DeviceHeuristics):
     @classmethod
     def get_config(cls, layer_config: LayerConfig, shape_m: int, gemm_type=GemmType.DENSE, **kwargs) -> dict:
         cls._check(layer_config, gemm_type)
+        if layer_config.a_dtype.num_bits < 16:
+            from humming.kernel.humming_mfma_f8 import plan_mfma_f8, select_f8_tile
+
+            plan = plan_mfma_f8(layer_config)
+            return select_f8_tile(shape_m, layer_config.shape_n, cls.num_cus(), plan).to_tuning_config()
         return select_tile(shape_m, layer_config.shape_n, cls.num_cus()).to_tuning_config()
 
     @classmethod

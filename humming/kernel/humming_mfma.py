@@ -58,6 +58,11 @@ def get_mfma_group_size(layer_config: LayerConfig) -> int:
 def get_mfma_unsupported_reason(layer_config: LayerConfig) -> str | None:
     if layer_config.num_experts:
         return "MoE layers (num_experts > 0)"
+    if layer_config.a_dtype.num_bits < 16:
+        # Low-bit activations: humming_mfma_f8 (humming/kernel/humming_mfma_f8.py).
+        from humming.kernel.humming_mfma_f8 import get_mfma_f8_unsupported_reason
+
+        return get_mfma_f8_unsupported_reason(layer_config)
     if layer_config.a_dtype not in (dtypes.float16, dtypes.bfloat16):
         return f"activation dtype {layer_config.a_dtype} (only float16/bfloat16 activations)"
     if layer_config.c_dtype != layer_config.a_dtype:
@@ -189,17 +194,25 @@ def prepare_mfma_kernels(layer_config, compute_config, tuning_config, device=Non
     device_index = get_device_index(device)
     layer_obj, _, entries = resolve_mfma_configs(layer_config, compute_config, tuning_config, device_index)
     layer_config_obj = LayerConfig(**layer_obj)
-    common = {
-        "a_dtype": str(layer_config_obj.a_dtype),
-        "num_bits": layer_config_obj.b_dtype.num_bits,
-        "group_size": get_mfma_group_size(layer_config_obj),
-        "has_zero_point": layer_config_obj.has_zero_point,
-    }
+    kernel_cls = HummingMfmaKernel
     tile_fields = {field.name for field in dataclasses.fields(MfmaTile)} | {"max_splits"}
+    if layer_config_obj.a_dtype.num_bits < 16:
+        from humming.kernel.humming_mfma_f8 import HummingMfmaF8Kernel, get_f8_kernel_args
+
+        kernel_cls = HummingMfmaF8Kernel
+        common = get_f8_kernel_args(layer_config_obj)
+        tile_fields = tile_fields - {"scale_b"}
+    else:
+        common = {
+            "a_dtype": str(layer_config_obj.a_dtype),
+            "num_bits": layer_config_obj.b_dtype.num_bits,
+            "group_size": get_mfma_group_size(layer_config_obj),
+            "has_zero_point": layer_config_obj.has_zero_point,
+        }
     specs = []
     for _, _, config in entries:
         kernel_args = common | {key: value for key, value in config.items() if key in tile_fields}
-        specs.append((HummingMfmaKernel, kernel_args))
+        specs.append((kernel_cls, kernel_args))
     kernels = KernelRuntime.compile_many(specs, device_index)
     num_cus = 0  # the launcher queries the CU count
     values = []

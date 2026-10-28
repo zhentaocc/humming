@@ -48,7 +48,8 @@ struct MfmaTileConfig {
   static constexpr bool kScaleB = kScaleB_;
   // 16-byte A units (8 values) per thread per 128-wide K chunk when staging through LDS.
   static constexpr uint32_t kLdsAUnitsPerThread = kLdsA ? kBlockM * 16 / kNumThreads : 0;
-  static constexpr uint32_t kLdsAUnits = kLdsA ? 2 * kBlockM * 16 : 1;  // double buffered
+  // One LDS A buffer per pipeline stage: chunk loads go straight to LDS (buffer_load ... lds).
+  static constexpr uint32_t kLdsAUnits = kLdsA ? kStages * kBlockM * 16 : 1;
   static_assert(kStages >= 2, "register prefetch needs at least two stages");
   static_assert(!kLdsA || kBlockM * 16 % kNumThreads == 0);
 };
@@ -165,6 +166,10 @@ struct MfmaWeightOnlyGemm {
   // u ^ (r % 16) so both the row-wise stores and the column-wise MFMA fragment reads
   // (16 rows, same unit) hit 16 distinct 16-byte bank groups.
   static constexpr uint32_t kLdsABufferUnits = TileConfig::kBlockM * 16;
+  // Vector memory loads issued by one load_chunk (vmcnt bookkeeping for the LDS A buffers).
+  static constexpr uint32_t kLoadsPerChunk = kTilesN * ((kBits + 3) / 4) +
+      (kIsChannelScale ? 0 : kTilesN * kGroupsPerChunk * (1 + kHasZeroPoint)) +
+      (kLdsA ? kLdsAUnits : kTilesM * kMfmaPerChunk);
 
   const uint16_t *a_ptr;
   const uint32_t *b_ptr;
@@ -179,11 +184,14 @@ struct MfmaWeightOnlyGemm {
   uint32_t thread_id;
   uint32_t block_m_offset;
   uint32_t local_m_offset;
-  mfma_u32x4_t *lds_a;
+  uint32_t warp_id;  // wave-uniform (readfirstlane)
+  // One LDS A buffer per stage, each its own __shared__ object: the compiler can then prove that
+  // the direct-to-LDS loads of the next chunk do not alias this chunk's ds_reads (otherwise it
+  // waits for them with vmcnt(0) before every read).
+  mfma_u32x4_t *lds_a[kStages];
 
   uint32_t regs_qb[kStages][kTilesN][kBits];
   mfma_u32x4_t regs_a[kStages][kLdsA ? 1 : kTilesM][kLdsA ? 1 : kMfmaPerChunk];
-  mfma_u32x4_t regs_a_share[kStages][kLdsA ? kLdsAUnits : 1];
   uint16_t regs_bs[kStages][kTilesN][kGroupsPerChunk];
   uint32_t regs_bzp[kStages][kTilesN][kGroupsPerChunk];
   CRegisters regs_c[kTilesM][kTilesN];
@@ -248,12 +256,19 @@ struct MfmaWeightOnlyGemm {
     const auto rsrc_a = mfma_make_buffer(a_ptr + static_cast<size_t>(block_m_offset) * shape_k);
     const uint32_t soffset_a = chunk_k * kChunkK * 2;
     if constexpr (kLdsA) {
+      // Direct-to-LDS loads: lane l of a wave writes LDS slot (wave base + l), so the swizzle
+      // is applied on the global side: slot s of row r holds 16-byte unit s ^ (r % 16).
+      constexpr uint32_t kNumWaves = TileConfig::kNumThreads / kWaveSize;
       PRAGMA_UNROLL
       for (uint32_t i = 0; i < kLdsAUnits; i++) {
-        const uint32_t unit_index = thread_id + i * TileConfig::kNumThreads;
-        const uint32_t row = MIN(block_m_offset + unit_index / 16, shape_m - 1) - block_m_offset;
-        const uint32_t voffset = (row * shape_k + unit_index % 16 * 8) * 2;
-        regs_a_share[stage][i] = __builtin_amdgcn_raw_buffer_load_b128(rsrc_a, voffset, soffset_a, 0);
+        const uint32_t wave_slot = (i * kNumWaves + warp_id) * kWaveSize;
+        const uint32_t slot = wave_slot + lane;
+        const uint32_t row = slot / 16;
+        const uint32_t unit = slot % 16 ^ row % 16;
+        const uint32_t global_row = MIN(block_m_offset + row, shape_m - 1) - block_m_offset;
+        const uint32_t voffset = (global_row * shape_k + unit * 8) * 2;
+        mfma_u32x4_t *dst = lds_a[stage] + wave_slot;
+        mfma_buffer_load_lds_b128(rsrc_a, dst, voffset, soffset_a);
       }
     } else {
       PRAGMA_UNROLL
@@ -285,18 +300,7 @@ struct MfmaWeightOnlyGemm {
   }
 
   CUDA_INLINE void compute_chunk(uint32_t stage, uint32_t chunk_k, uint32_t *channel_zero_points) {
-    mfma_u32x4_t *lds_buffer = lds_a + chunk_k % 2 * kLdsABufferUnits;
-    if constexpr (kLdsA) {
-      // One barrier per chunk: the other buffer was last read before this barrier's
-      // predecessor, so it is free to be overwritten by the next chunk.
-      PRAGMA_UNROLL
-      for (uint32_t i = 0; i < kLdsAUnits; i++) {
-        const uint32_t unit_index = thread_id + i * TileConfig::kNumThreads;
-        const uint32_t row = unit_index / 16;
-        lds_buffer[row * 16 + (unit_index % 16 ^ row % 16)] = regs_a_share[stage][i];
-      }
-      __syncthreads();
-    }
+    const mfma_u32x4_t *lds_buffer = lds_a[stage];
     PRAGMA_UNROLL
     for (uint32_t mfma_index = 0; mfma_index < kMfmaPerChunk; mfma_index++) {
       mfma_u32x4_t lds_regs_a[kLdsA ? kTilesM : 1];
@@ -379,6 +383,12 @@ struct MfmaWeightOnlyGemm {
       static_for<0, kStages>([&](auto stage_constant) {
         constexpr uint32_t stage = decltype(stage_constant)::value;
         constexpr uint32_t load_stage = (stage + kStages - 1) % kStages;
+        if constexpr (kLdsA) {
+          // This chunk's LDS A has landed for every wave (only the later kStages - 2 chunks may
+          // still be in flight), and every wave is done with the buffer the next load overwrites.
+          mfma_wait_vmcnt<(kStages - 2) * kLoadsPerChunk>();
+          __builtin_amdgcn_s_barrier();
+        }
         load_chunk(load_stage, MIN(chunk_begin + base + stage + kStages - 1, last_chunk));
         // Keep the prefetch issued ahead of this chunk's math; otherwise the scheduler
         // sinks the loads to the end of the unrolled body and the pipeline gets shallower.
@@ -389,7 +399,13 @@ struct MfmaWeightOnlyGemm {
     // Tail (< kStages chunks): all remaining data is already in flight.
     static_for<0, kStages - 1>([&](auto stage_constant) {
       constexpr uint32_t stage = decltype(stage_constant)::value;
-      if (base + stage < num_iters) compute_chunk(stage, chunk_begin + base + stage, channel_zero_points);
+      if (base + stage < num_iters) {
+        if constexpr (kLdsA) {
+          mfma_wait_vmcnt<(kStages - 2 - stage) * kLoadsPerChunk>();
+          __builtin_amdgcn_s_barrier();
+        }
+        compute_chunk(stage, chunk_begin + base + stage, channel_zero_points);
+      }
     });
 
     if constexpr (kScaleOnC && kGroupSize > kChunkK) {
@@ -457,10 +473,18 @@ __global__ __launch_bounds__(TileConfig::kNumThreads, 2) void humming_mfma(
   const uint32_t warp_m = warp_id / TileConfig::kWarpsN;
   const uint32_t warp_n = warp_id % TileConfig::kWarpsN;
 
-  __shared__ mfma_u32x4_t lds_a[TileConfig::kLdsAUnits];
+  constexpr uint32_t kLdsAUnits = TileConfig::kLdsA ? TileConfig::kBlockM * 16 : 1;
+  __shared__ mfma_u32x4_t lds_a0[kLdsAUnits];
+  __shared__ mfma_u32x4_t lds_a1[TileConfig::kStages > 1 ? kLdsAUnits : 1];
+  __shared__ mfma_u32x4_t lds_a2[TileConfig::kStages > 2 ? kLdsAUnits : 1];
+  __shared__ mfma_u32x4_t lds_a3[TileConfig::kStages > 3 ? kLdsAUnits : 1];
+  static_assert(TileConfig::kStages <= 4);
   Gemm gemm;
-  gemm.lds_a = lds_a;
+  mfma_u32x4_t *lds_buffers[4] = {lds_a0, lds_a1, lds_a2, lds_a3};
+  PRAGMA_UNROLL
+  for (uint32_t i = 0; i < TileConfig::kStages; i++) gemm.lds_a[i] = lds_buffers[i];
   gemm.thread_id = threadIdx.x;
+  gemm.warp_id = warp_id;
   gemm.block_m_offset = blockIdx.y * TileConfig::kBlockM;
   gemm.local_m_offset = warp_m * TileConfig::kWarpTilesM * 16;
   gemm.a_ptr = A;

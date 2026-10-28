@@ -54,6 +54,22 @@ CUDA_INLINE void mfma_buffer_load(__amdgpu_buffer_rsrc_t rsrc, uint32_t voffset,
   }
 }
 
+// 16-byte direct-to-LDS buffer load (gfx950): lane l writes its 16 bytes to `lds_base + 16 * l`;
+// `lds_base` must be wave-uniform (it goes to M0). Completion is tracked by vmcnt.
+CUDA_INLINE void mfma_buffer_load_lds_b128(__amdgpu_buffer_rsrc_t rsrc, const void *lds_base, uint32_t voffset, uint32_t soffset) {
+#if defined(__HIP_DEVICE_COMPILE__)
+  using LdsPtr = __attribute__((address_space(3))) void *;
+  __builtin_amdgcn_raw_ptr_buffer_load_lds(rsrc, (LdsPtr)(const_cast<void *>(lds_base)), 16, voffset, soffset, 0, 0);
+#endif
+}
+
+// s_waitcnt vmcnt(kCount) (gfx9 encoding, clamped to the 6-bit maximum), no expcnt/lgkmcnt wait.
+template <uint32_t kCount>
+CUDA_INLINE void mfma_wait_vmcnt() {
+  constexpr uint32_t n = kCount > 63 ? 63 : kCount;
+  __builtin_amdgcn_s_waitcnt((n & 0xF) | ((n >> 4) << 14) | (0x7 << 4) | (0xF << 8));
+}
+
 template <class ElementA, uint32_t kShapeM>
 struct MfmaOp;
 

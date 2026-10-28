@@ -150,8 +150,40 @@ struct MfmaDequant {
     return __builtin_bit_cast(uint32_t, __builtin_convertvector(float2, BFloat2));
   }
 
+  // BF16 shift-light path: the FP16 field x = 2^(10 - r) + code goes straight into
+  // v_fma_mix_f32(x, s, -(2^(10 - r) + zp) * s). Both products fit in 19 bits, so the FMA
+  // yields (code - zp) * s exactly in FP32 and v_cvt_pk_bf16_f32 rounds once: bit-identical
+  // to the FP16-subtract path, at 4 VALU per register instead of 6 (no packed BF16 math on gfx950).
+  CUDA_INLINE static void dequant_bf16_scaled(const uint32_t *qb, uint32_t *regs_b, uint32_t mfma_index, uint32_t prepared_zero_point, float scale) {
+    const float zero_point = kHasZeroPoint ? static_cast<float>(prepared_zero_point & 0xFFFFu) : static_cast<float>(1u << (kBits - 1));
+    PRAGMA_UNROLL
+    for (uint32_t i = 0; i < 4; i++) {
+      const uint32_t index = mfma_index * 4 + i;
+      const uint32_t word = index * 2 * kBits / 32;
+      const uint32_t shift = (kBits * 4 % 16 == 0 ? kBits * i : kBits * index) % 16;
+      const uint32_t residual = shift % 8;
+      const uint32_t mask = ((1u << kBits) - 1) * 0x00010001u << residual;
+      const uint32_t value = lop3_and_or(qb[word] >> (shift - residual), mask, magic_bits(residual));
+      const float offset = -(static_cast<float>(1u << (10 - residual)) + zero_point) * scale;
+      Float2 float2;
+#if defined(__HIP_DEVICE_COMPILE__)
+      // LLVM does not form v_fma_mix_f32 here (it emits cvt_f32_f16 + fma), so spell it out.
+      asm("v_fma_mix_f32 %0, %1, %2, %3 op_sel_hi:[1,0,0]" : "=v"(float2.x) : "v"(value), "v"(scale), "v"(offset));
+      asm("v_fma_mix_f32 %0, %1, %2, %3 op_sel:[1,0,0] op_sel_hi:[1,0,0]" : "=v"(float2.y) : "v"(value), "v"(scale), "v"(offset));
+#else
+      const Half2 half2 = __builtin_bit_cast(Half2, value);
+      float2 = {static_cast<float>(half2.x) * scale + offset, static_cast<float>(half2.y) * scale + offset};
+#endif
+      regs_b[i] = __builtin_bit_cast(uint32_t, __builtin_convertvector(float2, BFloat2));
+    }
+  }
+
   // Unscaled (code - zero point) in ElementA.
   CUDA_INLINE static void run(const uint32_t *qb, uint32_t *regs_b, uint32_t mfma_index, uint32_t prepared_zero_point) {
+    if constexpr (kIsBFloat16 && kShiftLight) {
+      dequant_bf16_scaled(qb, regs_b, mfma_index, prepared_zero_point, 1.0f);
+      return;
+    }
     dequant_f16(qb, regs_b, mfma_index, prepared_zero_point);
     if constexpr (kIsBFloat16) {
       PRAGMA_UNROLL
@@ -161,6 +193,10 @@ struct MfmaDequant {
 
   // (code - zero point) * scale in ElementA; `scale` is the raw 16-bit ElementA value.
   CUDA_INLINE static void run_scaled(const uint32_t *qb, uint32_t *regs_b, uint32_t mfma_index, uint32_t prepared_zero_point, uint16_t scale) {
+    if constexpr (kIsBFloat16 && kShiftLight) {
+      dequant_bf16_scaled(qb, regs_b, mfma_index, prepared_zero_point, __uint_as_float(static_cast<uint32_t>(scale) << 16));
+      return;
+    }
     dequant_f16(qb, regs_b, mfma_index, prepared_zero_point);
     if constexpr (kIsBFloat16) {
       const float scale_f32 = __uint_as_float(static_cast<uint32_t>(scale) << 16);

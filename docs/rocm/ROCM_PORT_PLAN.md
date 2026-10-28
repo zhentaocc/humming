@@ -2,7 +2,7 @@
 
 > 目标：让蚂蚁的 [vllm-project/humming](https://github.com/vllm-project/humming)（JIT 量化 GEMM 库）在 AMD Instinct（首发 MI355X / gfx950）上运行，并接入 vLLM ROCm。
 > 基线：humming `f970d0b`（2026-10-28），ROCm 7.1 / hipcc，torch 2.11.0+rocm7.2，单卡 MI355X。
-> 状态：**仅分析 + 计划，尚未写移植代码。**
+> 状态（2026-10-28，分支 `rocm-integrate`）：**gfx950 MFMA weight-only GEMM 已接入公开 API**（`HummingLayer` / `humming_forward`），支持 fp16/bf16 × INT1–8（对称或 uint8 zp）× per-channel/group scale；FP 权重、量化激活、MoE 仍为 NotImplementedError。测试见 `tests/rocm/`，性能见 [RESULTS.md](RESULTS.md)，集成记录见 [log_integrate.md](log_integrate.md)。
 
 ## TL;DR
 

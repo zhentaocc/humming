@@ -70,7 +70,33 @@ def get_hipcc_path() -> str:
     return found_path
 
 
+def _get_loaded_amdhip_library_path() -> str | None:
+    maps_path = Path("/proc/self/maps")
+    if not maps_path.is_file():
+        return None
+    for maps_line in maps_path.read_text().splitlines():
+        mapped_path = maps_line.split()[-1] if maps_line.split() else ""
+        if Path(mapped_path).name.startswith("libamdhip64.so"):
+            return mapped_path
+    return None
+
+
+@functools.cache
 def get_amdhip_library_path() -> str:
+    """HIP runtime library that humming must share with torch.
+
+    torch wheels bundle their own libamdhip64. Loading a second copy (e.g. from /opt/rocm)
+    creates an independent HIP runtime: its streams are not ordered with torch's, so a kernel
+    launched there races with torch allocations and copies. Always prefer torch's copy.
+    """
+    if torch.cuda.is_available():
+        torch.cuda.init()
+    loaded_library_path = _get_loaded_amdhip_library_path()
+    if loaded_library_path is not None:
+        return loaded_library_path
+    torch_library_path = Path(torch.__file__).parent / "lib" / "libamdhip64.so"
+    if torch_library_path.exists():
+        return str(torch_library_path)
     library_path = get_rocm_library_path() / "libamdhip64.so"
     if library_path.exists():
         return str(library_path)

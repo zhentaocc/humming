@@ -51,3 +51,46 @@ XCDs on their own), an explicit `s_waitcnt vmcnt(0)` and a relaxed atomic counte
 
 Large M is now the problem: each wave owns only 16 output columns and re-reads A from
 L2 for every 16 columns (A traffic = M*K*2 * N/16).
+
+## Iteration 3: tile sweep + LDS-staged A
+
+Larger per-wave tiles (`tiles_m x tiles_n` MFMAs per chunk) cut A re-reads, but with
+direct global loads every wave of the block loads the same A rows. `kLdsA` loads the
+block's A chunk once (spread over all threads), stores it to a double-buffered LDS
+ring (one `__syncthreads` per chunk) and each wave reads its fragments from LDS.
+16-byte unit `u` of row `r` lives at slot `u ^ (r % 16)`, which makes both the store
+and the fragment reads bank-conflict free.
+Dead end: HIP's `uint4` is a class; arrays of it in the LDS path got scratch allocas
+(256 B/lane). Switching to a native `ext_vector_type(4)` (`mfma_u32x4_t`) fixed it.
+
+## Iteration 4: B-side group scaling (`kScaleB`)
+
+With group scales, the fp32 accumulator is rescaled per group (C-side): tiles_m*tiles_n*4
+v_fma per group, and partial sums are flushed per group. `kScaleB` multiplies the
+dequantized B fragment by the group scale (`v_pk_mul_f16`, one per 2 values) before the
+MFMA, so the accumulator never has to be touched. That is cheaper when tiles_m >= 4.
+bf16 has no packed multiply on gfx950 (it goes through fp32), so the win there is small.
+At the 2,4,4,2 tile: group C-side 591 us vs per-channel 490 us (M=1024, 28672x8192).
+B-side scaling recovers most of that gap.
+
+## Iteration 5: gfx950 `v_bitop3_b32` for `lop3`
+
+The kernel is VALU-bound: 16x16x32 MFMA ~16 cycles vs ~4 cycles per wave64 VALU op, so
+more than about 4 VALU ops per MFMA stalls the matrix core. gfx9 VOP3 cannot encode
+literals, so the generic `(a & mask) | magic` costs 2 ops plus a constant in a register.
+`__builtin_amdgcn_bitop3_b32(a, b, c, lut)` uses the same LUT convention as PTX `lop3`
+(checked on hardware) and does it in one op. That covers all of Humming's dequant.
+
+28672x8192, 4-bit g128 fp16 (torch fp16: ~90 us M<=64, 134 us M=255, 370 us M=1024):
+
+| tile | M=1 | M=16 | M=64 | M=255 | M=1024 |
+|---|---|---|---|---|---|
+| 1,4,1,1,4 (no LDS) | 38.5 | 71.3 | 234.8 | - | - |
+| 1,4,4,2,2,lds | 50.9 | 53.5 | 65.4 | 170.1 | 593 |
+| 1,4,8,2,2,lds,sb (before bitop3) | - | - | - | - | 498 |
+| 1,4,8,2,2,lds,sb | 72.1 | 74.6 | 83.2 | 140.0 | 482.1 (998 TFLOPs) |
+
+Dead ends: 2,2,8,2 (128 KB LDS, occupancy 1) and 1,4,4,4,2,lds,sb (174 VGPR + 88 AGPR,
+occupancy 1) both ran about 2x slower at M=1024.
+Remaining VALU per 128 MFMAs in the 1,4,8,2 loop: 64 bitop3, 64 pk_add, 64 pk_mul,
+48 lshr, about 34 64-bit address ops (`v_lshl_add_u64`).

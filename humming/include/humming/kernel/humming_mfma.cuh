@@ -26,7 +26,15 @@
 #include <humming/utils/all.cuh>
 
 
-template <uint32_t kWarpsM_, uint32_t kWarpsN_, uint32_t kWarpTilesM_, uint32_t kWarpTilesN_, uint32_t kStages_>
+// kLdsA: stage the block's A tile through LDS (shared by all waves along N) instead of
+// every wave loading its own A fragments from global memory; needed once M is large.
+// kScaleB: apply group scales to the dequantized 16-bit B fragment (packed multiply, as
+// Humming's CUDA mainloop does) instead of to a per-group FP32 accumulator. Saves the
+// temporary accumulators and the MFMA -> VALU dependency at every group boundary, at the
+// cost of rounding (code - zp) * scale to FP16/BF16.
+template <
+    uint32_t kWarpsM_, uint32_t kWarpsN_, uint32_t kWarpTilesM_, uint32_t kWarpTilesN_, uint32_t kStages_,
+    bool kLdsA_ = false, bool kScaleB_ = false>
 struct MfmaTileConfig {
   static constexpr uint32_t kWarpsM = kWarpsM_;
   static constexpr uint32_t kWarpsN = kWarpsN_;
@@ -36,7 +44,13 @@ struct MfmaTileConfig {
   static constexpr uint32_t kNumThreads = kWarpsM * kWarpsN * kWaveSize;
   static constexpr uint32_t kBlockM = kWarpsM * kWarpTilesM * 16;
   static constexpr uint32_t kBlockN = kWarpsN * kWarpTilesN * 16;
+  static constexpr bool kLdsA = kLdsA_;
+  static constexpr bool kScaleB = kScaleB_;
+  // 16-byte A units (8 values) per thread per 128-wide K chunk when staging through LDS.
+  static constexpr uint32_t kLdsAUnitsPerThread = kLdsA ? kBlockM * 16 / kNumThreads : 0;
+  static constexpr uint32_t kLdsAUnits = kLdsA ? 2 * kBlockM * 16 : 1;  // double buffered
   static_assert(kStages >= 2, "register prefetch needs at least two stages");
+  static_assert(!kLdsA || kBlockM * 16 % kNumThreads == 0);
 };
 
 
@@ -46,6 +60,20 @@ CUDA_INLINE float mfma_half_to_float(uint16_t bits) {
     return __half2float(__ushort_as_half(bits));
   } else {
     return __uint_as_float(static_cast<uint32_t>(bits) << 16);
+  }
+}
+
+// Multiply both 16-bit halves of `value` by the 16-bit `scale` (v_pk_mul_f16 for FP16).
+template <class ElementA>
+CUDA_INLINE uint32_t mfma_scale_half2(uint32_t value, uint16_t scale) {
+  if constexpr (std::is_same<ElementA, Float16>::value) {
+    using Half2 = _Float16 __attribute__((ext_vector_type(2)));
+    const Half2 scale2 = __builtin_bit_cast(Half2, static_cast<uint32_t>(scale) * 0x00010001u);
+    return __builtin_bit_cast(uint32_t, __builtin_bit_cast(Half2, value) * scale2);
+  } else {
+    using BFloat2 = __bf16 __attribute__((ext_vector_type(2)));
+    const BFloat2 scale2 = __builtin_bit_cast(BFloat2, static_cast<uint32_t>(scale) * 0x00010001u);
+    return __builtin_bit_cast(uint32_t, __builtin_bit_cast(BFloat2, value) * scale2);
   }
 }
 
@@ -130,6 +158,15 @@ struct MfmaWeightOnlyGemm {
   // Scales (and zero points) referenced by one 128-wide K chunk.
   static constexpr uint32_t kGroupsPerChunk = kIsChannelScale ? 1 : MAX(kChunkK / kGroupSize, 1);
   static constexpr uint32_t kMfmaPerGroup = kIsChannelScale ? kMfmaPerChunk : MIN(kGroupSize / Op::K, kMfmaPerChunk);
+  static constexpr bool kLdsA = TileConfig::kLdsA;
+  static constexpr bool kScaleOnB = !kIsChannelScale && TileConfig::kScaleB;
+  // Group scales on a temporary FP32 accumulator (exact (code - zp), FP32 scaling).
+  static constexpr bool kScaleOnC = !kIsChannelScale && !kScaleOnB;
+  static constexpr uint32_t kLdsAUnits = TileConfig::kLdsAUnitsPerThread;
+  // LDS A tile: kBlockM rows x 16 units of 16 bytes; unit u of row r is stored at slot
+  // u ^ (r % 16) so both the row-wise stores and the column-wise MFMA fragment reads
+  // (16 rows, same unit) hit 16 distinct 16-byte bank groups.
+  static constexpr uint32_t kLdsABufferUnits = TileConfig::kBlockM * 16;
 
   const uint16_t *a_ptr;
   const uint32_t *b_ptr;
@@ -141,13 +178,18 @@ struct MfmaWeightOnlyGemm {
   uint32_t lane;
   uint32_t m_offset;
   uint32_t n_tile_offset;
+  uint32_t thread_id;
+  uint32_t block_m_offset;
+  uint32_t local_m_offset;
+  mfma_u32x4_t *lds_a;
 
   uint32_t regs_qb[kStages][kTilesN][kBits];
-  uint4 regs_a[kStages][kTilesM][kMfmaPerChunk];
+  mfma_u32x4_t regs_a[kStages][kLdsA ? 1 : kTilesM][kLdsA ? 1 : kMfmaPerChunk];
+  mfma_u32x4_t regs_a_share[kStages][kLdsA ? kLdsAUnits : 1];
   uint16_t regs_bs[kStages][kTilesN][kGroupsPerChunk];
   uint32_t regs_bzp[kStages][kTilesN][kGroupsPerChunk];
   CRegisters regs_c[kTilesM][kTilesN];
-  CRegisters regs_group_c[kIsChannelScale ? 1 : kTilesM][kIsChannelScale ? 1 : kTilesN];
+  CRegisters regs_group_c[kScaleOnC ? kTilesM : 1][kScaleOnC ? kTilesN : 1];
 
   CUDA_INLINE bool is_tile_n_valid(uint32_t tile_n) const {
     return (n_tile_offset + tile_n) * 16 < shape_n;
@@ -177,7 +219,7 @@ struct MfmaWeightOnlyGemm {
       if constexpr (kBits % 4 == 0) {
         PRAGMA_UNROLL
         for (uint32_t i = 0; i < kBits / 4; i++) {
-          *reinterpret_cast<uint4 *>(&regs_qb[stage][tile_n][i * 4]) = reinterpret_cast<const uint4 *>(src)[i];
+          *reinterpret_cast<mfma_u32x4_t *>(&regs_qb[stage][tile_n][i * 4]) = reinterpret_cast<const mfma_u32x4_t *>(src)[i];
         }
       } else {
         PRAGMA_UNROLL
@@ -195,14 +237,24 @@ struct MfmaWeightOnlyGemm {
       }
     }
 
-    PRAGMA_UNROLL
-    for (uint32_t tile_m = 0; tile_m < kTilesM; tile_m++) {
-      // Rows past M re-read row M - 1: A row r only feeds C row r, which is not stored.
-      const uint32_t row = MIN(m_offset + tile_m * 16 + Op::a_row(lane), shape_m - 1);
-      const uint16_t *src = a_ptr + static_cast<size_t>(row) * shape_k + chunk_k * kChunkK + Op::ab_k(lane, 0);
+    if constexpr (kLdsA) {
       PRAGMA_UNROLL
-      for (uint32_t mfma_index = 0; mfma_index < kMfmaPerChunk; mfma_index++) {
-        regs_a[stage][tile_m][mfma_index] = *reinterpret_cast<const uint4 *>(src + mfma_index * Op::K);
+      for (uint32_t i = 0; i < kLdsAUnits; i++) {
+        const uint32_t unit_index = thread_id + i * TileConfig::kNumThreads;
+        const uint32_t row = MIN(block_m_offset + unit_index / 16, shape_m - 1);
+        const uint16_t *src = a_ptr + static_cast<size_t>(row) * shape_k + chunk_k * kChunkK + unit_index % 16 * 8;
+        regs_a_share[stage][i] = *reinterpret_cast<const mfma_u32x4_t *>(src);
+      }
+    } else {
+      PRAGMA_UNROLL
+      for (uint32_t tile_m = 0; tile_m < kTilesM; tile_m++) {
+        // Rows past M re-read row M - 1: A row r only feeds C row r, which is not stored.
+        const uint32_t row = MIN(m_offset + tile_m * 16 + Op::a_row(lane), shape_m - 1);
+        const uint16_t *src = a_ptr + static_cast<size_t>(row) * shape_k + chunk_k * kChunkK + Op::ab_k(lane, 0);
+        PRAGMA_UNROLL
+        for (uint32_t mfma_index = 0; mfma_index < kMfmaPerChunk; mfma_index++) {
+          regs_a[stage][tile_m][mfma_index] = *reinterpret_cast<const mfma_u32x4_t *>(src + mfma_index * Op::K);
+        }
       }
     }
   }
@@ -223,8 +275,29 @@ struct MfmaWeightOnlyGemm {
   }
 
   CUDA_INLINE void compute_chunk(uint32_t stage, uint32_t chunk_k, uint32_t *channel_zero_points) {
+    mfma_u32x4_t *lds_buffer = lds_a + chunk_k % 2 * kLdsABufferUnits;
+    if constexpr (kLdsA) {
+      // One barrier per chunk: the other buffer was last read before this barrier's
+      // predecessor, so it is free to be overwritten by the next chunk.
+      PRAGMA_UNROLL
+      for (uint32_t i = 0; i < kLdsAUnits; i++) {
+        const uint32_t unit_index = thread_id + i * TileConfig::kNumThreads;
+        const uint32_t row = unit_index / 16;
+        lds_buffer[row * 16 + (unit_index % 16 ^ row % 16)] = regs_a_share[stage][i];
+      }
+      __syncthreads();
+    }
     PRAGMA_UNROLL
     for (uint32_t mfma_index = 0; mfma_index < kMfmaPerChunk; mfma_index++) {
+      mfma_u32x4_t lds_regs_a[kLdsA ? kTilesM : 1];
+      if constexpr (kLdsA) {
+        PRAGMA_UNROLL
+        for (uint32_t tile_m = 0; tile_m < kTilesM; tile_m++) {
+          const uint32_t row = local_m_offset + tile_m * 16 + Op::a_row(lane);
+          const uint32_t unit = mfma_index * 4 + lane / 16;
+          lds_regs_a[tile_m] = lds_buffer[row * 16 + (unit ^ row % 16)];
+        }
+      }
       const uint32_t group = mfma_index / kMfmaPerGroup % kGroupsPerChunk;
       PRAGMA_UNROLL
       for (uint32_t tile_n = 0; tile_n < kTilesN; tile_n++) {
@@ -236,21 +309,32 @@ struct MfmaWeightOnlyGemm {
         }
         uint32_t regs_b[Op::kRegsAB];
         Dequant::run(regs_qb[stage][tile_n], regs_b, mfma_index, zero_point);
+        if constexpr (kScaleOnB) {
+          PRAGMA_UNROLL
+          for (uint32_t i = 0; i < Op::kRegsAB; i++) {
+            regs_b[i] = mfma_scale_half2<ElementA>(regs_b[i], regs_bs[stage][tile_n][group]);
+          }
+        }
         PRAGMA_UNROLL
         for (uint32_t tile_m = 0; tile_m < kTilesM; tile_m++) {
-          const uint32_t *regs_a_ptr = reinterpret_cast<const uint32_t *>(&regs_a[stage][tile_m][mfma_index]);
-          if constexpr (kIsChannelScale) {
+          const uint32_t *regs_a_ptr;
+          if constexpr (kLdsA) {
+            regs_a_ptr = reinterpret_cast<const uint32_t *>(&lds_regs_a[tile_m]);
+          } else {
+            regs_a_ptr = reinterpret_cast<const uint32_t *>(&regs_a[stage][tile_m][mfma_index]);
+          }
+          if constexpr (!kScaleOnC) {
             Op::fma(regs_a_ptr, regs_b, regs_c[tile_m][tile_n]);
           } else {
             Op::fma(regs_a_ptr, regs_b, regs_group_c[tile_m][tile_n]);
           }
         }
       }
-      if constexpr (!kIsChannelScale && kGroupSize < kChunkK) {
+      if constexpr (kScaleOnC && kGroupSize < kChunkK) {
         if ((mfma_index + 1) % kMfmaPerGroup == 0) apply_group_scale(stage, group);
       }
     }
-    if constexpr (!kIsChannelScale && kGroupSize >= kChunkK) {
+    if constexpr (kScaleOnC && kGroupSize >= kChunkK) {
       if ((chunk_k + 1) * kChunkK % kGroupSize == 0) apply_group_scale(stage, 0);
     }
   }
@@ -261,7 +345,7 @@ struct MfmaWeightOnlyGemm {
       PRAGMA_UNROLL
       for (uint32_t tile_n = 0; tile_n < kTilesN; tile_n++) {
         regs_c[tile_m][tile_n] = CRegisters{};
-        if constexpr (!kIsChannelScale) regs_group_c[tile_m][tile_n] = CRegisters{};
+        if constexpr (kScaleOnC) regs_group_c[tile_m][tile_n] = CRegisters{};
       }
     }
 
@@ -297,7 +381,7 @@ struct MfmaWeightOnlyGemm {
       if (base + stage < num_iters) compute_chunk(stage, chunk_begin + base + stage, channel_zero_points);
     });
 
-    if constexpr (!kIsChannelScale && kGroupSize > kChunkK) {
+    if constexpr (kScaleOnC && kGroupSize > kChunkK) {
       // A K split that ends inside a group still owes that group's scale.
       if (num_iters > 0 && chunk_end * kChunkK % kGroupSize != 0) {
         PRAGMA_UNROLL
@@ -358,7 +442,12 @@ __global__ __launch_bounds__(TileConfig::kNumThreads) void humming_mfma(
   const uint32_t warp_m = warp_id / TileConfig::kWarpsN;
   const uint32_t warp_n = warp_id % TileConfig::kWarpsN;
 
+  __shared__ mfma_u32x4_t lds_a[TileConfig::kLdsAUnits];
   Gemm gemm;
+  gemm.lds_a = lds_a;
+  gemm.thread_id = threadIdx.x;
+  gemm.block_m_offset = blockIdx.y * TileConfig::kBlockM;
+  gemm.local_m_offset = warp_m * TileConfig::kWarpTilesM * 16;
   gemm.a_ptr = A;
   gemm.b_ptr = B;
   gemm.bs_ptr = BS;

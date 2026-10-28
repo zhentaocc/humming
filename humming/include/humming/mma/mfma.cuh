@@ -25,6 +25,7 @@ using mfma_f16x8_t = _Float16 __attribute__((ext_vector_type(8)));
 using mfma_bf16x8_t = __bf16 __attribute__((ext_vector_type(8)));
 using mfma_f32x4_t = float __attribute__((ext_vector_type(4)));
 using mfma_f32x16_t = float __attribute__((ext_vector_type(16)));
+using mfma_u32x4_t = uint32_t __attribute__((ext_vector_type(4)));
 
 constexpr uint32_t kWaveSize = 64;
 

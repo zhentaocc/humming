@@ -12,8 +12,14 @@ CUDA_INLINE uint32_t prmt(uint32_t a, uint32_t b, uint32_t s) {
   return __builtin_amdgcn_perm(b, a, selector);
 };
 
+// gfx950 has a native LOP3 (v_bitop3_b32, same truth-table encoding as PTX lop3). On
+// other targets the generic form is used; note that gfx9 VOP3 cannot take literal
+// constants, so the compiler splits e.g. (a & 0xF000F) | 0x64006400 into two VOP2 ops.
 template <uint32_t lut>
 CUDA_INLINE uint32_t lop3(uint32_t a, uint32_t b, uint32_t c) {
+#if defined(__gfx950__)
+  return __builtin_amdgcn_bitop3_b32(a, b, c, lut);
+#else
   uint32_t res = 0;
   PRAGMA_UNROLL
   for (uint32_t i = 0; i < 8; i++) {
@@ -25,14 +31,15 @@ CUDA_INLINE uint32_t lop3(uint32_t a, uint32_t b, uint32_t c) {
     }
   }
   return res;
+#endif
 };
 
 CUDA_INLINE uint32_t lop3_and_or(uint32_t a, uint32_t b, uint32_t c) {
-  return (a & b) | c;
+  return lop3<(0xF0 & 0xCC) | 0xAA>(a, b, c);
 };
 
 CUDA_INLINE uint32_t lop3_and_xor(uint32_t a, uint32_t b, uint32_t c) {
-  return (a & b) ^ c;
+  return lop3<(0xF0 & 0xCC) ^ 0xAA>(a, b, c);
 };
 #else
 CUDA_INLINE uint32_t prmt(uint32_t a, uint32_t b, uint32_t s) {

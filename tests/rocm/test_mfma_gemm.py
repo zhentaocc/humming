@@ -44,11 +44,25 @@ def test_small_shapes(dtype, num_bits, group_size, has_zero_point, shape_m):
         MfmaTile(1, 4, 2, 2, 2),
         MfmaTile(2, 2, 4, 2, 2),
         MfmaTile(4, 1, 1, 4, 3),
+        MfmaTile(2, 2, 4, 4, 2, lds_a=True),
+        MfmaTile(1, 4, 2, 2, 3, lds_a=True),
+        MfmaTile(1, 4, 8, 2, 2, lds_a=True, scale_b=True),
     ],
 )
 @pytest.mark.parametrize("num_splits", [1, 2, 3, 8])
 def test_tiles_and_splits(dtype, tile, num_splits):
     _, rel = run_case(100, 512, 2048, 4, 128, True, dtype, tile=tile, num_splits=num_splits)
+    assert rel < TOLERANCE[dtype]
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("num_bits", [2, 3, 4, 8])
+@pytest.mark.parametrize("group_size", [0, 32, 128])
+@pytest.mark.parametrize("shape_m", [1, 77, 300])
+@pytest.mark.parametrize("scale_b", [False, True])
+def test_lds_a_tile(dtype, num_bits, group_size, shape_m, scale_b):
+    tile = MfmaTile(1, 4, 8, 2, 2, lds_a=True, scale_b=scale_b) if scale_b else MfmaTile(2, 2, 4, 4, 2, lds_a=True)
+    _, rel = run_case(shape_m, 384, 1024, num_bits, group_size, group_size > 0, dtype, tile=tile)
     assert rel < TOLERANCE[dtype]
 
 

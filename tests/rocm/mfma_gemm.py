@@ -18,7 +18,7 @@ SOURCE_TEMPLATE = r"""
 
 using ElementA = {element_a};
 using ElementQB = UInt{bits};
-using Tile = MfmaTileConfig<{warps_m}, {warps_n}, {tiles_m}, {tiles_n}, {stages}>;
+using Tile = MfmaTileConfig<{warps_m}, {warps_n}, {tiles_m}, {tiles_n}, {stages}, {lds_a}, {scale_b}>;
 constexpr uint32_t kGroupSize = {group_size};
 constexpr bool kHasZeroPoint = {has_zero_point};
 
@@ -44,6 +44,8 @@ class MfmaTile:
     tiles_m: int = 1
     tiles_n: int = 1
     stages: int = 4
+    lds_a: bool = False
+    scale_b: bool = False
 
     @property
     def block_m(self) -> int:
@@ -74,6 +76,8 @@ def _load_kernel(key: MfmaKernelKey):
         tiles_m=key.tile.tiles_m,
         tiles_n=key.tile.tiles_n,
         stages=key.tile.stages,
+        lds_a="true" if key.tile.lds_a else "false",
+        scale_b="true" if key.tile.scale_b else "false",
         group_size=key.group_size,
         has_zero_point="true" if key.has_zero_point else "false",
     )

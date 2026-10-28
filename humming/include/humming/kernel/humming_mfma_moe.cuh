@@ -91,11 +91,16 @@ struct MfmaMoeGemm : MfmaWeightOnlyGemm<ElementA, ElementQB, TileConfig, kGroupS
     const auto rsrc_a = mfma_make_buffer(this->a_ptr);
     const uint32_t soffset_a = chunk_k * kChunkK * 2;
     if constexpr (kLdsA) {
+      // Direct-to-LDS like the dense kernel: slot (wave_slot + lane) == thread_id + i * kNumThreads,
+      // so a_row_bytes[i] is the row of this slot; the swizzle is applied on the global side.
+      constexpr uint32_t kNumWaves = TileConfig::kNumThreads / kWaveSize;
       PRAGMA_UNROLL
       for (uint32_t i = 0; i < kLdsAUnits; i++) {
-        const uint32_t unit_index = this->thread_id + i * TileConfig::kNumThreads;
-        this->regs_a_share[stage][i] =
-            __builtin_amdgcn_raw_buffer_load_b128(rsrc_a, a_row_bytes[i] + unit_index % 16 * 16, soffset_a, 0);
+        const uint32_t wave_slot = (i * kNumWaves + this->warp_id) * kWaveSize;
+        const uint32_t slot = wave_slot + this->lane;
+        const uint32_t row = slot / 16;
+        const uint32_t unit = slot % 16 ^ row % 16;
+        mfma_buffer_load_lds_b128(rsrc_a, this->lds_a[stage] + wave_slot, a_row_bytes[i] + unit * 16, soffset_a);
       }
     } else {
       PRAGMA_UNROLL
@@ -142,6 +147,10 @@ struct MfmaMoeGemm : MfmaWeightOnlyGemm<ElementA, ElementQB, TileConfig, kGroupS
       static_for<0, kStages>([&](auto stage_constant) {
         constexpr uint32_t stage = decltype(stage_constant)::value;
         constexpr uint32_t load_stage = (stage + kStages - 1) % kStages;
+        if constexpr (kLdsA) {
+          mfma_wait_vmcnt<(kStages - 2) * Base::kLoadsPerChunk>();
+          __builtin_amdgcn_s_barrier();
+        }
         load_chunk(load_stage, MIN(chunk_begin + base + stage + kStages - 1, last_chunk));
         __builtin_amdgcn_sched_barrier(0);
         this->compute_chunk(stage, chunk_begin + base + stage, channel_zero_points);
@@ -149,7 +158,13 @@ struct MfmaMoeGemm : MfmaWeightOnlyGemm<ElementA, ElementQB, TileConfig, kGroupS
     }
     static_for<0, kStages - 1>([&](auto stage_constant) {
       constexpr uint32_t stage = decltype(stage_constant)::value;
-      if (base + stage < num_iters) this->compute_chunk(stage, chunk_begin + base + stage, channel_zero_points);
+      if (base + stage < num_iters) {
+        if constexpr (kLdsA) {
+          mfma_wait_vmcnt<(kStages - 2 - stage) * Base::kLoadsPerChunk>();
+          __builtin_amdgcn_s_barrier();
+        }
+        this->compute_chunk(stage, chunk_begin + base + stage, channel_zero_points);
+      }
     });
 
     if constexpr (kScaleOnC && kGroupSize > kChunkK) {
@@ -281,7 +296,12 @@ __global__ __launch_bounds__(TileConfig::kNumThreads, 2) void humming_mfma_moe(
   constexpr uint32_t kNumThreads = TileConfig::kNumThreads;
   constexpr uint32_t kInvalidRow = 0xFFFFFFFFu;
 
-  __shared__ mfma_u32x4_t lds_a[TileConfig::kLdsAUnits];
+  constexpr uint32_t kLdsABufferUnits = TileConfig::kLdsA ? kBlockM * 16 : 1;
+  __shared__ mfma_u32x4_t lds_a0[kLdsABufferUnits];
+  __shared__ mfma_u32x4_t lds_a1[TileConfig::kStages > 1 ? kLdsABufferUnits : 1];
+  __shared__ mfma_u32x4_t lds_a2[TileConfig::kStages > 2 ? kLdsABufferUnits : 1];
+  __shared__ mfma_u32x4_t lds_a3[TileConfig::kStages > 3 ? kLdsABufferUnits : 1];
+  static_assert(TileConfig::kStages <= 4);
   __shared__ uint32_t lds_a_rows[kBlockM];
   __shared__ uint32_t lds_c_rows[kBlockM];
   __shared__ int32_t lds_block_info[3];
@@ -328,7 +348,10 @@ __global__ __launch_bounds__(TileConfig::kNumThreads, 2) void humming_mfma_moe(
   const size_t expert_index = static_cast<uint32_t>(expert);
 
   Gemm gemm;
-  gemm.lds_a = lds_a;
+  mfma_u32x4_t *lds_buffers[4] = {lds_a0, lds_a1, lds_a2, lds_a3};
+  PRAGMA_UNROLL
+  for (uint32_t i = 0; i < TileConfig::kStages; i++) gemm.lds_a[i] = lds_buffers[i];
+  gemm.warp_id = warp_id;
   gemm.thread_id = threadIdx.x;
   gemm.block_m_offset = 0;
   gemm.local_m_offset = warp_m * TileConfig::kWarpTilesM * 16;

@@ -157,12 +157,22 @@ struct MfmaWeightOnlyGemm {
     return (n_tile_offset + tile_n) * 16 + Op::c_col(lane);
   }
 
+  // Out-of-range N tiles / M rows are clamped to valid addresses instead of predicated:
+  // their results are never stored, and branch-free loads let the waitcnt pass keep the
+  // register prefetch in flight (a guarded load forces s_waitcnt vmcnt(0) at the join).
+  CUDA_INLINE uint32_t clamped_n_tile(uint32_t tile_n) const {
+    return MIN(n_tile_offset + tile_n, shape_n / 16 - 1);
+  }
+
+  CUDA_INLINE uint32_t clamped_column(uint32_t tile_n) const {
+    return clamped_n_tile(tile_n) * 16 + Op::c_col(lane);
+  }
+
   CUDA_INLINE void load_chunk(uint32_t stage, uint32_t chunk_k) {
     const uint32_t num_chunks_k = shape_k / kChunkK;
     PRAGMA_UNROLL
     for (uint32_t tile_n = 0; tile_n < kTilesN; tile_n++) {
-      if (!is_tile_n_valid(tile_n)) continue;
-      const size_t chunk_index = static_cast<size_t>(n_tile_offset + tile_n) * num_chunks_k + chunk_k;
+      const size_t chunk_index = static_cast<size_t>(clamped_n_tile(tile_n)) * num_chunks_k + chunk_k;
       const uint32_t *src = b_ptr + (chunk_index * kWaveSize + lane) * kBits;
       if constexpr (kBits % 4 == 0) {
         PRAGMA_UNROLL
@@ -178,7 +188,7 @@ struct MfmaWeightOnlyGemm {
         PRAGMA_UNROLL
         for (uint32_t group = 0; group < kGroupsPerChunk; group++) {
           const uint32_t group_index = (chunk_k * kChunkK + group * MIN(kGroupSize, kChunkK)) / kGroupSize;
-          const size_t offset = static_cast<size_t>(group_index) * shape_n + column(tile_n);
+          const size_t offset = static_cast<size_t>(group_index) * shape_n + clamped_column(tile_n);
           regs_bs[stage][tile_n][group] = bs_ptr[offset];
           if constexpr (kHasZeroPoint) regs_bzp[stage][tile_n][group] = bzp_ptr[offset];
         }
@@ -187,13 +197,12 @@ struct MfmaWeightOnlyGemm {
 
     PRAGMA_UNROLL
     for (uint32_t tile_m = 0; tile_m < kTilesM; tile_m++) {
-      const uint32_t row = m_offset + tile_m * 16 + Op::a_row(lane);
+      // Rows past M re-read row M - 1: A row r only feeds C row r, which is not stored.
+      const uint32_t row = MIN(m_offset + tile_m * 16 + Op::a_row(lane), shape_m - 1);
       const uint16_t *src = a_ptr + static_cast<size_t>(row) * shape_k + chunk_k * kChunkK + Op::ab_k(lane, 0);
       PRAGMA_UNROLL
       for (uint32_t mfma_index = 0; mfma_index < kMfmaPerChunk; mfma_index++) {
-        uint4 value = make_uint4(0, 0, 0, 0);
-        if (row < shape_m) value = *reinterpret_cast<const uint4 *>(src + mfma_index * Op::K);
-        regs_a[stage][tile_m][mfma_index] = value;
+        regs_a[stage][tile_m][mfma_index] = *reinterpret_cast<const uint4 *>(src + mfma_index * Op::K);
       }
     }
   }
@@ -265,21 +274,28 @@ struct MfmaWeightOnlyGemm {
     }
 
     const uint32_t num_iters = chunk_end - chunk_begin;
+    if (num_iters == 0) return;
+    // Prefetches past the end of this K range re-load the last chunk (an L2 hit) so that
+    // every load is unconditional; see clamped_n_tile.
+    const uint32_t last_chunk = chunk_end - 1;
     static_for<0, kStages - 1>([&](auto stage) {
-      if (decltype(stage)::value < num_iters) load_chunk(decltype(stage)::value, chunk_begin + decltype(stage)::value);
+      load_chunk(decltype(stage)::value, MIN(chunk_begin + decltype(stage)::value, last_chunk));
     });
 
-    for (uint32_t base = 0; base < num_iters; base += kStages) {
+    uint32_t base = 0;
+    for (; base + kStages <= num_iters; base += kStages) {
       static_for<0, kStages>([&](auto stage_constant) {
         constexpr uint32_t stage = decltype(stage_constant)::value;
         constexpr uint32_t load_stage = (stage + kStages - 1) % kStages;
-        const uint32_t iter = base + stage;
-        if (iter < num_iters) {
-          if (iter + kStages - 1 < num_iters) load_chunk(load_stage, chunk_begin + iter + kStages - 1);
-          compute_chunk(stage, chunk_begin + iter, channel_zero_points);
-        }
+        load_chunk(load_stage, MIN(chunk_begin + base + stage + kStages - 1, last_chunk));
+        compute_chunk(stage, chunk_begin + base + stage, channel_zero_points);
       });
     }
+    // Tail (< kStages chunks): all remaining data is already in flight.
+    static_for<0, kStages - 1>([&](auto stage_constant) {
+      constexpr uint32_t stage = decltype(stage_constant)::value;
+      if (base + stage < num_iters) compute_chunk(stage, chunk_begin + base + stage, channel_zero_points);
+    });
 
     if constexpr (!kIsChannelScale && kGroupSize > kChunkK) {
       // A K split that ends inside a group still owes that group's scale.
@@ -368,28 +384,34 @@ __global__ __launch_bounds__(TileConfig::kNumThreads) void humming_mfma(
   }
 
   // Split-K: publish FP32 partials, the last block of this output tile reduces them.
+  //
+  // An agent-scope release/acquire fence on gfx950 is a full L2 writeback + invalidate
+  // (buffer_wbl2 sc1 / buffer_inv sc1, L2 is per XCD), which cost ~4 us per split. Instead
+  // every partial is itself an agent-scope (relaxed atomic) store/load, which is coherent
+  // across XCDs on its own; we only have to make sure the stores have completed
+  // (s_waitcnt vmcnt(0), gfx9 counts stores in vmcnt) before the counter increment.
   const size_t split_stride = static_cast<size_t>(shape_m) * shape_n;
   gemm.for_each_output([&](uint32_t row, uint32_t col, float value) {
-    workspace[blockIdx.z * split_stride + static_cast<size_t>(row) * shape_n + col] = value;
+    float *ptr = &workspace[blockIdx.z * split_stride + static_cast<size_t>(row) * shape_n + col];
+    __hip_atomic_store(ptr, value, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
   });
-  __threadfence();
+  __builtin_amdgcn_s_waitcnt(0x0F70);  // vmcnt(0) expcnt(7) lgkmcnt(15)
   __syncthreads();
 
   __shared__ uint32_t is_last_block;
   const uint32_t tile_id = blockIdx.y * gridDim.x + blockIdx.x;
   if (threadIdx.x == 0) {
-    uint32_t arrived = __hip_atomic_fetch_add(&tile_counters[tile_id], 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
+    uint32_t arrived = __hip_atomic_fetch_add(&tile_counters[tile_id], 1u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
     is_last_block = arrived == num_splits - 1;
   }
   __syncthreads();
   if (!is_last_block) return;
-  __threadfence();
 
   gemm.for_each_output([&](uint32_t row, uint32_t col, float) {
     const size_t offset = static_cast<size_t>(row) * shape_n + col;
     float sum = 0.0f;
     for (uint32_t split = 0; split < num_splits; split++) {
-      sum += __builtin_nontemporal_load(&workspace[split * split_stride + offset]);
+      sum += __hip_atomic_load(&workspace[split * split_stride + offset], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
     }
     C[offset] = mfma_float_to_half<ElementA>(sum);
   });

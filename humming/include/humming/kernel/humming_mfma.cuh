@@ -63,20 +63,6 @@ CUDA_INLINE float mfma_half_to_float(uint16_t bits) {
   }
 }
 
-// Multiply both 16-bit halves of `value` by the 16-bit `scale` (v_pk_mul_f16 for FP16).
-template <class ElementA>
-CUDA_INLINE uint32_t mfma_scale_half2(uint32_t value, uint16_t scale) {
-  if constexpr (std::is_same<ElementA, Float16>::value) {
-    using Half2 = _Float16 __attribute__((ext_vector_type(2)));
-    const Half2 scale2 = __builtin_bit_cast(Half2, static_cast<uint32_t>(scale) * 0x00010001u);
-    return __builtin_bit_cast(uint32_t, __builtin_bit_cast(Half2, value) * scale2);
-  } else {
-    using BFloat2 = __bf16 __attribute__((ext_vector_type(2)));
-    const BFloat2 scale2 = __builtin_bit_cast(BFloat2, static_cast<uint32_t>(scale) * 0x00010001u);
-    return __builtin_bit_cast(uint32_t, __builtin_bit_cast(BFloat2, value) * scale2);
-  }
-}
-
 template <class ElementA>
 CUDA_INLINE uint16_t mfma_float_to_half(float value) {
   if constexpr (std::is_same<ElementA, Float16>::value) {
@@ -91,51 +77,63 @@ CUDA_INLINE uint16_t mfma_float_to_half(float value) {
 
 
 // Dequantize the lane's packed words into the 16-bit B fragment of MFMA `mfma_index`.
+//
+// Both activation types use Humming's FP16 magic-number dequant: (code - zero point) is an
+// exact FP16 integer for codes up to 10 bits and costs packed FP16 ops. gfx950 has no
+// packed BF16 arithmetic (Humming's BF16 path would convert every __hsub2 through FP32),
+// so for BF16 the exact FP16 pair is widened with v_cvt_f32_f16 / v_fma_mix_f32, which
+// can also fold in the group scale, and narrowed with one v_cvt_pk_bf16_f32.
 template <class ElementQB, class ElementA, bool kHasZeroPoint>
 struct MfmaDequant {
   static constexpr uint32_t kBits = ElementQB::kBits;
+  static constexpr bool kIsBFloat16 = std::is_same<ElementA, BFloat16>::value;
   static_assert(ElementQB::kIsIntegerType && !ElementQB::kIsSigned);
+  static_assert(kBits <= Float16::kMantissaBits - kHasZeroPoint);
 
-  // Humming's magic-number path keeps (code - zero point) exact only while it fits the
-  // 16-bit mantissa; BF16 with 7/8-bit codes takes a small FP32 detour instead.
-  static constexpr uint32_t kMaxHummingBits = std::is_same<ElementA, Float16>::value ? 10 : 7;
-  static constexpr bool kUseHummingDequant = kBits <= kMaxHummingBits - kHasZeroPoint;
+  using Half2 = _Float16 __attribute__((ext_vector_type(2)));
+  using BFloat2 = __bf16 __attribute__((ext_vector_type(2)));
+  using Float2 = float __attribute__((ext_vector_type(2)));
 
   // `zero_point` is the raw code; the result is what run() expects as `prepared_zero_point`.
   CUDA_INLINE static uint32_t prepare_zero_point(uint32_t zero_point) {
-    if constexpr (kUseHummingDequant && kHasZeroPoint) {
-      return dequant_single_zero_point<ElementQB, ElementA>(zero_point);
-    } else if constexpr (kHasZeroPoint) {
-      return zero_point;
+    if constexpr (kHasZeroPoint) {
+      return dequant_single_zero_point<ElementQB, Float16>(zero_point);
     } else {
       return 0;
     }
   }
 
+  CUDA_INLINE static void dequant_f16(const uint32_t *qb, uint32_t *regs_b, uint32_t mfma_index, uint32_t prepared_zero_point) {
+    uint32_t zp_vals[4] = {prepared_zero_point, prepared_zero_point, prepared_zero_point, prepared_zero_point};
+    dequant<ElementQB, Float16, kHasZeroPoint, false>(qb, regs_b, mfma_index, zp_vals);
+  }
+
+  CUDA_INLINE static uint32_t f16x2_to_bf16x2(uint32_t value, float scale) {
+    const Half2 half2 = __builtin_bit_cast(Half2, value);
+    const Float2 float2 = {static_cast<float>(half2.x) * scale, static_cast<float>(half2.y) * scale};
+    return __builtin_bit_cast(uint32_t, __builtin_convertvector(float2, BFloat2));
+  }
+
+  // Unscaled (code - zero point) in ElementA.
   CUDA_INLINE static void run(const uint32_t *qb, uint32_t *regs_b, uint32_t mfma_index, uint32_t prepared_zero_point) {
-    if constexpr (kUseHummingDequant) {
-      uint32_t zp_vals[4] = {prepared_zero_point, prepared_zero_point, prepared_zero_point, prepared_zero_point};
-      dequant<ElementQB, ElementA, kHasZeroPoint, false>(qb, regs_b, mfma_index, zp_vals);
-    } else {
-      static_assert(std::is_same<ElementA, BFloat16>::value && static_next_power_of_2(kBits) == 8);
-      constexpr uint32_t kMask = (1u << kBits) - 1;
-      const float zero_point = kHasZeroPoint ? static_cast<float>(prepared_zero_point) : static_cast<float>(1u << (kBits - 1));
+    dequant_f16(qb, regs_b, mfma_index, prepared_zero_point);
+    if constexpr (kIsBFloat16) {
       PRAGMA_UNROLL
-      for (uint32_t i = 0; i < 4; i++) {
-        // Same value placement as dequant_b1248/b3567 with 8-bit padded fields.
-        const uint32_t word_index = (mfma_index * 4 + i) / 2;
-        uint32_t word;
-        if constexpr (kBits == 8) {
-          word = qb[word_index];
-        } else {
-          word = get_quanted_value_group<kBits, true>(qb, word_index);
-        }
-        const uint32_t shift = i % 2 * 8;
-        float low = static_cast<float>((word >> shift) & kMask) - zero_point;
-        float high = static_cast<float>((word >> (shift + 16)) & kMask) - zero_point;
-        // Small integers are exact in BF16, so truncating the FP32 bits is exact.
-        regs_b[i] = __builtin_amdgcn_perm(__float_as_uint(high), __float_as_uint(low), 0x07060302u);
-      }
+      for (uint32_t i = 0; i < 4; i++) regs_b[i] = f16x2_to_bf16x2(regs_b[i], 1.0f);
+    }
+  }
+
+  // (code - zero point) * scale in ElementA; `scale` is the raw 16-bit ElementA value.
+  CUDA_INLINE static void run_scaled(const uint32_t *qb, uint32_t *regs_b, uint32_t mfma_index, uint32_t prepared_zero_point, uint16_t scale) {
+    dequant_f16(qb, regs_b, mfma_index, prepared_zero_point);
+    if constexpr (kIsBFloat16) {
+      const float scale_f32 = __uint_as_float(static_cast<uint32_t>(scale) << 16);
+      PRAGMA_UNROLL
+      for (uint32_t i = 0; i < 4; i++) regs_b[i] = f16x2_to_bf16x2(regs_b[i], scale_f32);
+    } else {
+      const Half2 scale2 = __builtin_bit_cast(Half2, static_cast<uint32_t>(scale) * 0x00010001u);
+      PRAGMA_UNROLL
+      for (uint32_t i = 0; i < 4; i++) regs_b[i] = __builtin_bit_cast(uint32_t, __builtin_bit_cast(Half2, regs_b[i]) * scale2);
     }
   }
 };
@@ -320,12 +318,10 @@ struct MfmaWeightOnlyGemm {
           zero_point = Dequant::prepare_zero_point(regs_bzp[stage][tile_n][group]);
         }
         uint32_t regs_b[Op::kRegsAB];
-        Dequant::run(regs_qb[stage][tile_n], regs_b, mfma_index, zero_point);
         if constexpr (kScaleOnB) {
-          PRAGMA_UNROLL
-          for (uint32_t i = 0; i < Op::kRegsAB; i++) {
-            regs_b[i] = mfma_scale_half2<ElementA>(regs_b[i], regs_bs[stage][tile_n][group]);
-          }
+          Dequant::run_scaled(regs_qb[stage][tile_n], regs_b, mfma_index, zero_point, regs_bs[stage][tile_n][group]);
+        } else {
+          Dequant::run(regs_qb[stage][tile_n], regs_b, mfma_index, zero_point);
         }
         PRAGMA_UNROLL
         for (uint32_t tile_m = 0; tile_m < kTilesM; tile_m++) {
@@ -440,8 +436,10 @@ struct MfmaWeightOnlyGemm {
 };
 
 
+// Min 2 blocks per CU caps VGPR + AGPR at 256 per lane (2 waves/SIMD for 4-wave blocks). Without it the
+// bf16 8-row tile allocated 170 VGPR + 96 AGPR and fell to occupancy 1; fp16 is unaffected.
 template <class ElementA, class ElementQB, class TileConfig, uint32_t kGroupSize, bool kHasZeroPoint>
-__global__ __launch_bounds__(TileConfig::kNumThreads) void humming_mfma(
+__global__ __launch_bounds__(TileConfig::kNumThreads, 2) void humming_mfma(
     const uint16_t *__restrict__ A,
     const uint32_t *__restrict__ B,
     const uint16_t *__restrict__ BS,

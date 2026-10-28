@@ -102,11 +102,13 @@ def main():
     parser.add_argument("--ms", default=",".join(map(str, DEFAULT_MS)))
     parser.add_argument("--shapes", default=",".join(f"{n}x{k}" for n, k in DEFAULT_SHAPES))
     parser.add_argument("--check", action="store_true", help="also check correctness vs FP32 torch")
+    parser.add_argument("--check-only", action="store_true", help="correctness only, no timing")
     parser.add_argument("--tile", default=None, help="warps_m,warps_n,tiles_m,tiles_n,stages[,lds_a[,scale_b]]")
     parser.add_argument("--splits", type=int, default=None)
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iters", type=int, default=100)
     args = parser.parse_args()
+    args.check = args.check or args.check_only
 
     dtype = torch.float16 if args.dtype == "fp16" else torch.bfloat16
     ms = [int(m) for m in args.ms.split(",")]
@@ -118,7 +120,9 @@ def main():
         tile = MfmaTile(*fields[:5], lds_a=bool(fields[5]), scale_b=bool(fields[6]))
 
     print(f"# bits={args.bits} group={args.group} zp={args.zp} dtype={args.dtype}")
-    header = "| M | N | K | tile (wm,wn,tm,tn,st) x splits | us | TB/s | TFLOPs | torch fp16 us | torch TB/s | speedup |"
+    header = "| M | N | K | tile (wm,wn,tm,tn,st) x splits |"
+    if not args.check_only:
+        header += " us | TB/s | TFLOPs | torch us | torch TB/s | speedup |"
     if args.check:
         header += " max abs err | max rel err |"
     print(header)
@@ -129,12 +133,13 @@ def main():
             selected_tile, selected_splits = select_tile(shape_m, shape_n, shape_k)
             used_tile = tile or selected_tile
             used_splits = args.splits or selected_splits
-            r = bench_shape(shape_m, shape_n, shape_k, args, linear, dtype, tile, args.splits)
             t = used_tile
-            row = (
-                f"| {shape_m} | {shape_n} | {shape_k} | {t.warps_m},{t.warps_n},{t.tiles_m},{t.tiles_n},{t.stages}{',lds' if t.lds_a else ''}{',sb' if t.scale_b else ''} x{used_splits} "
-                f"| {r['us']:.1f} | {r['tbs']:.2f} | {r['tflops']:.1f} | {r['us_ref']:.1f} | {r['tbs_ref']:.2f} | {r['speedup']:.2f}x |"
-            )
+            row = f"| {shape_m} | {shape_n} | {shape_k} | {t.warps_m},{t.warps_n},{t.tiles_m},{t.tiles_n},{t.stages}{',lds' if t.lds_a else ''}{',sb' if t.scale_b else ''} x{used_splits} |"
+            if not args.check_only:
+                r = bench_shape(shape_m, shape_n, shape_k, args, linear, dtype, tile, args.splits)
+                row += (
+                    f" {r['us']:.1f} | {r['tbs']:.2f} | {r['tflops']:.1f} | {r['us_ref']:.1f} | {r['tbs_ref']:.2f} | {r['speedup']:.2f}x |"
+                )
             if args.check:
                 inputs = torch.randn(shape_m, shape_k, dtype=dtype, device="cuda")
                 outputs = mfma_gemm(

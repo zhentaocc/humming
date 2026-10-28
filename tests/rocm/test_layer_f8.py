@@ -49,6 +49,7 @@ CASES = [
     ("int4-g128-ag32-e8m0", {"dtype": "int4", "group_size": 128}, F8_MX),
     ("int4-g32", {"dtype": "int4", "group_size": 32}, F8_TOKEN),
     ("int4-g64", {"dtype": "int4", "group_size": 64}, F8_TOKEN),
+    ("int4-g256", {"dtype": "int4", "group_size": 256}, F8_TOKEN),
     ("int4-channel", {"dtype": "int4"}, F8_TOKEN),
     ("uint4-zp-g128", {"dtype": "uint4", "group_size": 128, "has_zero_point": True}, F8_TOKEN),
     ("uint3-zp-g64", {"dtype": "uint3", "group_size": 64, "has_zero_point": True}, F8_TOKEN),
@@ -74,10 +75,16 @@ CASES = [
     ("a-int8-int8", {"dtype": "int8"}, I8_TOKEN),
     ("a-int8-int4-g128", {"dtype": "int4", "group_size": 128}, I8_TOKEN),
     ("a-int8-int4-channel", {"dtype": "int4"}, I8_TOKEN),
+    ("a-int8-int4-g256", {"dtype": "int4", "group_size": 256}, I8_TOKEN),
     ("a-int8-uint4-zp-g128", {"dtype": "uint4", "group_size": 128, "has_zero_point": True}, I8_TOKEN),
     ("a-int8-mxfp4", FP4_MX, I8_TOKEN),
 ]
 CASE_BY_ID = {case_id: (weight, inputs) for case_id, weight, inputs in CASES}
+
+# One case per kernel family; M values hit every tile bucket of select_f8_tile (64-row tiles with
+# three stages, 128-row tiles, 2 x 2-wave FP4 tiles) with partial M and N tiles (N = 2112).
+TILE_BUCKET_CASES = ["e4m3-channel", "int4-g128", "int4-g256", "uint3-zp-g64", "mxfp4", "a-mxfp4-mxfp4", "a-int8-int8", "a-int8-int4-g128"]
+TILE_BUCKET_M = [100, 300, 2049, 3000]
 
 REAL_SHAPE_CASES = ["e4m3-channel", "e4m3-block128-ag128", "int4-g64", "mxfp4", "a-mxfp4-mxfp4", "a-int8-int8"]
 
@@ -155,6 +162,12 @@ def check(case_id: str, shape_m: int, shape_n: int, shape_k: int, torch_dtype=to
 @pytest.mark.parametrize("case_id", list(CASE_BY_ID))
 def test_layer_f8(case_id: str, shape_m: int):
     check(case_id, shape_m, SHAPE_N, SHAPE_K)
+
+
+@pytest.mark.parametrize("shape_m", TILE_BUCKET_M)
+@pytest.mark.parametrize("case_id", TILE_BUCKET_CASES)
+def test_layer_f8_tile_buckets(case_id: str, shape_m: int):
+    check(case_id, shape_m, 2112, SHAPE_K)
 
 
 @pytest.mark.parametrize("shape_m", [1, 16, 1024])

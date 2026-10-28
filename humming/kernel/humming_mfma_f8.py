@@ -456,23 +456,46 @@ extern "C" __constant__ uint32_t MFMA_F8_AS_GROUP = {{p.as_group}};
 
 
 def select_f8_tile(shape_m: int, shape_n: int, num_cus: int, plan: MfmaF8Plan) -> MfmaTile:
+    """Tile per M bucket (measured on MI355X, docs/rocm/log_f8.md, "Tiles").
+
+    At low occupancy the mainloop is latency-bound, so small M / N prefer narrow tiles (one 16-col
+    MFMA tile per wave, more blocks) with three prefetch stages; 128-row tiles only pay off with a
+    few blocks per CU. FP4 activations prefer 2 x 2 waves of 64 x 64 at large M (halves the LDS A
+    reads per MFMA). LUT-dequantized weights keep 1 x 4 waves of 128 x 32 (each dequantized B tile
+    feeds 8 MFMAs) and two stages (registers).
+    """
+    fp4_a = plan.a_fmt == FMT_E2M1
     if shape_m <= 8:
         tiles_n = 2 if shape_n // 128 >= num_cus // 2 else 1
         return MfmaTile(tiles_m=1, tiles_n=tiles_n, stages=4)
     if shape_m <= 32:
-        tile = MfmaTile(tiles_m=2, tiles_n=2, stages=2, lds_a=True)
+        tile = MfmaTile(tiles_m=2, tiles_n=2, stages=2, lds_a=True) if fp4_a else MfmaTile(tiles_m=2, tiles_n=1, stages=3, lds_a=True)
     elif shape_m <= 64:
-        tile = MfmaTile(tiles_m=4, tiles_n=2, stages=2, lds_a=True)
+        tile = MfmaTile(tiles_m=4, tiles_n=2 if fp4_a else 1, stages=3, lds_a=True)
+    elif fp4_a:
+        if math.ceil(shape_n / 128) * math.ceil(shape_m / 128) <= num_cus:
+            tile = MfmaTile(tiles_m=4, tiles_n=2, stages=3, lds_a=True)
+        else:
+            tile = MfmaTile(warps_m=2, warps_n=2, tiles_m=4, tiles_n=4, stages=2, lds_a=True)
     else:
-        tile = MfmaTile(tiles_m=8, tiles_n=2, stages=2, lds_a=True)
-    row_units = 4 if plan.a_fmt == FMT_E2M1 else 8
+        blocks_128x64 = math.ceil(shape_n / 64) * math.ceil(shape_m / 128)
+        if blocks_128x64 < num_cus:
+            tile = MfmaTile(tiles_m=4, tiles_n=1, stages=3, lds_a=True)
+        elif blocks_128x64 < 4 * num_cus:
+            tile = MfmaTile(tiles_m=8, tiles_n=1, stages=2, lds_a=True)
+        else:
+            tile = MfmaTile(tiles_m=8, tiles_n=2, stages=2 if plan.b_mode == B_LUT else 3, lds_a=True)
+    row_units = 4 if fp4_a else 8
     threads = tile.warps_m * tile.warps_n * 64
     if tile.block_m * row_units % threads:
         tile = dataclasses.replace(tile, lds_a=False)
     return tile
 
 
-F8_M_INTERVALS = ((0, 8), (8, 32), (32, 64), (64, 1 << 30))
+# M intervals (min exclusive, max inclusive); select_f8_tile is evaluated at each upper bound.
+F8_M_INTERVALS = (
+    (0, 8), (8, 32), (32, 64), (64, 128), (128, 256), (256, 512), (512, 1024), (1024, 2048), (2048, 1 << 30)
+)
 
 
 def get_f8_tuning_configs(config: LayerConfig, num_cus: int) -> list:

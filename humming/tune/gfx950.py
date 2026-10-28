@@ -100,4 +100,7 @@ class Gfx950Heuristics(DeviceHeuristics):
     @classmethod
     def get_configs(cls, layer_config: LayerConfig, gemm_type=GemmType.DENSE, **kwargs) -> list:
         cls._check(layer_config, gemm_type)
-        return [[low, high, cls.get_config(layer_config, high, gemm_type)] for low, high in M_INTERVALS]
+        intervals = M_INTERVALS
+        if layer_config.a_dtype.num_bits < 16:
+            from humming.kernel.humming_mfma_f8 import F8_M_INTERVALS as intervals
+        return [[low, high, cls.get_config(layer_config, high, gemm_type)] for low, high in intervals]

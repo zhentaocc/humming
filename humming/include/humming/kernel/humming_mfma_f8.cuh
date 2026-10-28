@@ -188,7 +188,7 @@ struct MfmaF8Gemm {
   uint32_t regs_as[kStages][kTilesM][kAsFlush ? kFlushesPerChunk : 1][kAsFlush ? 4 : 1];
   uint32_t regs_asb[kStages][kTilesM];
   uint32_t regs_bzp[kStages][kTilesN][kZpBlocks];
-  Acc regs_part[kTilesM][kTilesN];
+  Acc regs_part[kIsInt8 && !kHasFlushScale ? kTilesM : 1][kIsInt8 && !kHasFlushScale ? kTilesN : 1];
   mfma_f32x4_t regs_c[kTilesM][kTilesN];
 
   CUDA_INLINE bool is_tile_n_valid(uint32_t tile_n) const {
@@ -334,33 +334,60 @@ struct MfmaF8Gemm {
     }
   }
 
-  CUDA_INLINE void flush(uint32_t stage, uint32_t f, bool apply_scale) {
+  // Final conversion of the integer accumulator (INT8 without flush scales).
+  CUDA_INLINE void flush_int8() {
     PRAGMA_UNROLL
-    for (uint32_t tile_n = 0; tile_n < kTilesN; tile_n++) {
-      float ws = 1.0f;
-      if constexpr (kWsMode == kMfmaF8ScaleFlush) {
-        if (apply_scale) ws = __uint_as_float(regs_ws[stage][tile_n][f]);
-      } else if constexpr (kWsMode == kMfmaF8ScaleE8m0Flush) {
-        if (apply_scale) ws = mfma_e8m0_to_float(regs_ws[stage][tile_n][f]);
-      }
+    for (uint32_t tile_m = 0; tile_m < kTilesM; tile_m++) {
       PRAGMA_UNROLL
-      for (uint32_t tile_m = 0; tile_m < kTilesM; tile_m++) {
+      for (uint32_t tile_n = 0; tile_n < kTilesN; tile_n++) {
         PRAGMA_UNROLL
-        for (uint32_t r = 0; r < 4; r++) {
-          float scale = ws;
-          if constexpr (kAsMode == kMfmaF8ScaleFlush) {
-            scale *= __uint_as_float(regs_as[stage][tile_m][f][r]);
-          } else if constexpr (kAsMode == kMfmaF8ScaleE8m0Flush) {
-            scale *= mfma_e8m0_to_float(regs_as[stage][tile_m][f][r]);
-          }
-          regs_c[tile_m][tile_n][r] += static_cast<float>(regs_part[tile_m][tile_n][r]) * scale;
-          regs_part[tile_m][tile_n][r] = 0;
-        }
+        for (uint32_t r = 0; r < 4; r++) regs_c[tile_m][tile_n][r] = static_cast<float>(regs_part[tile_m][tile_n][r]);
       }
     }
   }
 
-  CUDA_INLINE void compute_chunk(uint32_t stage, uint32_t chunk_k, uint32_t chunk_end, const uint32_t *lut) {
+  // A operand registers of MFMA `unit` of the chunk for one 16-row tile.
+  CUDA_INLINE void load_a_unit(uint32_t stage, const mfma_u32x4_t *lds_buffer, uint32_t unit, uint32_t tile_m, uint32_t *dst) const {
+    if constexpr (kLdsA) {
+      const uint32_t row = local_m_offset + tile_m * 16 + lane % 16;
+      const uint32_t lg = lane / 16;
+      const uint8_t *row_ptr = reinterpret_cast<const uint8_t *>(lds_buffer + row * kRowUnits);
+      auto unit_ptr = [&](uint32_t u) { return row_ptr + (u ^ row % kRowUnits) * 16; };
+      if constexpr (kIsL32) {
+        const uint32_t u = unit * 2 + lg / 2;
+        const uint2 v = *reinterpret_cast<const uint2 *>(unit_ptr(u) + lg % 2 * 8);
+        dst[0] = v.x, dst[1] = v.y;
+      } else {
+        // L128 (8-bit: units lg, 4 + lg) / TRUE (fp4: unit lg); int8 x64 unit u: unit 4 u + lg.
+        PRAGMA_UNROLL
+        for (uint32_t i = 0; i < kARegsPerUnit / 4; i++) {
+          const uint32_t u = (kUnits == 2 ? unit : i) * 4 + lg;
+          const mfma_u32x4_t v = *reinterpret_cast<const mfma_u32x4_t *>(unit_ptr(u));
+          dst[i * 4 + 0] = v.x, dst[i * 4 + 1] = v.y, dst[i * 4 + 2] = v.z, dst[i * 4 + 3] = v.w;
+        }
+      }
+    } else {
+      PRAGMA_UNROLL
+      for (uint32_t i = 0; i < kARegsPerUnit; i++) dst[i] = regs_a[stage][tile_m][unit * kARegsPerUnit + i];
+    }
+  }
+
+  template <class AccT>
+  CUDA_INLINE void mma(uint32_t stage, const uint32_t *a, const uint32_t *b, AccT &acc, uint32_t tile_m, uint32_t tile_n) const {
+    if constexpr (kMfmaK == 128) {
+      const uint32_t scale_a = kAsMode == kMfmaF8ScaleHw ? regs_asb[stage][tile_m] : 127u;
+      const uint32_t scale_b = kWsMode == kMfmaF8ScaleHw ? regs_wsb[stage][tile_n] : 127u;
+      mfma_scale_16x16x128<kAFmt, kBFmt>(a, b, acc, scale_a, scale_b);
+    } else if constexpr (kMfmaK == 64) {
+      mfma_i8_16x16x64(a, b, acc);
+    } else if constexpr (kIsInt8) {
+      mfma_i8_16x16x32(a, b, acc);
+    } else {
+      mfma_f8_16x16x32<kAFmt, kBFmt>(a, b, acc);
+    }
+  }
+
+  CUDA_INLINE void compute_chunk(uint32_t stage, uint32_t chunk_k, const uint32_t *lut) {
     mfma_u32x4_t *lds_buffer = lds_a + chunk_k % 2 * kLdsBufferUnits;
     if constexpr (kLdsA) {
       PRAGMA_UNROLL
@@ -385,67 +412,71 @@ struct MfmaF8Gemm {
       }
     }
 
+    // B is dequantized once per (flush group, tile_n) and reused by every tile_m; A is read from
+    // LDS / registers per tile_m right before its MFMAs (keeps only one A tile live).
     PRAGMA_UNROLL
-    for (uint32_t unit = 0; unit < kUnits; unit++) {
-      uint32_t a_unit[kTilesM][kARegsPerUnit];
-      PRAGMA_UNROLL
-      for (uint32_t tile_m = 0; tile_m < kTilesM; tile_m++) {
-        if constexpr (kLdsA) {
-          const uint32_t row = local_m_offset + tile_m * 16 + lane % 16;
-          const uint32_t lg = lane / 16;
-          const uint8_t *row_ptr = reinterpret_cast<const uint8_t *>(lds_buffer + row * kRowUnits);
-          auto unit_ptr = [&](uint32_t u) { return row_ptr + (u ^ row % kRowUnits) * 16; };
-          if constexpr (kIsL32) {
-            const uint32_t u = unit * 2 + lg / 2;
-            const uint2 v = *reinterpret_cast<const uint2 *>(unit_ptr(u) + lg % 2 * 8);
-            a_unit[tile_m][0] = v.x, a_unit[tile_m][1] = v.y;
-          } else {
-            // L128 (8-bit: units lg, 4 + lg) / TRUE (fp4: unit lg); int8 x64 unit u: unit 4 u + lg.
-            PRAGMA_UNROLL
-            for (uint32_t i = 0; i < kARegsPerUnit / 4; i++) {
-              const uint32_t u = (kUnits == 2 ? unit : i) * 4 + lg;
-              const mfma_u32x4_t v = *reinterpret_cast<const mfma_u32x4_t *>(unit_ptr(u));
-              a_unit[tile_m][i * 4 + 0] = v.x, a_unit[tile_m][i * 4 + 1] = v.y;
-              a_unit[tile_m][i * 4 + 2] = v.z, a_unit[tile_m][i * 4 + 3] = v.w;
-            }
-          }
-        } else {
-          PRAGMA_UNROLL
-          for (uint32_t i = 0; i < kARegsPerUnit; i++) a_unit[tile_m][i] = regs_a[stage][tile_m][unit * kARegsPerUnit + i];
-        }
-      }
-
+    for (uint32_t f = 0; f < kFlushesPerChunk; f++) {
+      uint32_t b_flush[kTilesN][kUnitsPerFlush][kBRegsPerUnit];
       PRAGMA_UNROLL
       for (uint32_t tile_n = 0; tile_n < kTilesN; tile_n++) {
-        uint32_t b_unit[kBRegsPerUnit];
         PRAGMA_UNROLL
-        for (uint32_t i = 0; i < kBRegsPerUnit; i++) {
-          b_unit[i] = dequant_reg(regs_qb[stage][tile_n], unit * kBRegsPerUnit + i, lut, zp_prepared[tile_n]);
-        }
-        PRAGMA_UNROLL
-        for (uint32_t tile_m = 0; tile_m < kTilesM; tile_m++) {
-          if constexpr (kMfmaK == 128) {
-            const uint32_t scale_a = kAsMode == kMfmaF8ScaleHw ? regs_asb[stage][tile_m] : 127u;
-            const uint32_t scale_b = kWsMode == kMfmaF8ScaleHw ? regs_wsb[stage][tile_n] : 127u;
-            mfma_scale_16x16x128<kAFmt, kBFmt>(a_unit[tile_m], b_unit, regs_part[tile_m][tile_n], scale_a, scale_b);
-          } else if constexpr (kMfmaK == 64) {
-            mfma_i8_16x16x64(a_unit[tile_m], b_unit, regs_part[tile_m][tile_n]);
-          } else if constexpr (kIsInt8) {
-            mfma_i8_16x16x32(a_unit[tile_m], b_unit, regs_part[tile_m][tile_n]);
-          } else {
-            mfma_f8_16x16x32<kAFmt, kBFmt>(a_unit[tile_m], b_unit, regs_part[tile_m][tile_n]);
+        for (uint32_t u = 0; u < kUnitsPerFlush; u++) {
+          PRAGMA_UNROLL
+          for (uint32_t i = 0; i < kBRegsPerUnit; i++) {
+            b_flush[tile_n][u][i] = dequant_reg(regs_qb[stage][tile_n], (f * kUnitsPerFlush + u) * kBRegsPerUnit + i, lut, zp_prepared[tile_n]);
           }
         }
       }
-
-      if constexpr (kHasFlushScale && kScaleK < kChunkK) {
-        if ((unit + 1) % kUnitsPerFlush == 0) flush(stage, unit / kUnitsPerFlush, true);
+      float ws[kTilesN];
+      PRAGMA_UNROLL
+      for (uint32_t tile_n = 0; tile_n < kTilesN; tile_n++) {
+        if constexpr (kWsMode == kMfmaF8ScaleFlush) {
+          ws[tile_n] = __uint_as_float(regs_ws[stage][tile_n][f]);
+        } else if constexpr (kWsMode == kMfmaF8ScaleE8m0Flush) {
+          ws[tile_n] = mfma_e8m0_to_float(regs_ws[stage][tile_n][f]);
+        } else {
+          ws[tile_n] = 1.0f;
+        }
       }
-    }
-
-    if constexpr (kHasFlushScale && kScaleK >= kChunkK) {
-      // Group end, or the end of this K split (which then owes the partial group's scale).
-      if ((chunk_k + 1) * kChunkK % kScaleK == 0 || chunk_k + 1 == chunk_end) flush(stage, 0, true);
+      PRAGMA_UNROLL
+      for (uint32_t tile_m = 0; tile_m < kTilesM; tile_m++) {
+        uint32_t a_flush[kUnitsPerFlush][kARegsPerUnit];
+        PRAGMA_UNROLL
+        for (uint32_t u = 0; u < kUnitsPerFlush; u++) load_a_unit(stage, lds_buffer, f * kUnitsPerFlush + u, tile_m, a_flush[u]);
+        float as_f[4];
+        PRAGMA_UNROLL
+        for (uint32_t r = 0; r < 4; r++) {
+          if constexpr (kAsMode == kMfmaF8ScaleFlush) {
+            as_f[r] = __uint_as_float(regs_as[stage][tile_m][f][r]);
+          } else if constexpr (kAsMode == kMfmaF8ScaleE8m0Flush) {
+            as_f[r] = mfma_e8m0_to_float(regs_as[stage][tile_m][f][r]);
+          } else {
+            as_f[r] = 1.0f;
+          }
+        }
+        PRAGMA_UNROLL
+        for (uint32_t tile_n = 0; tile_n < kTilesN; tile_n++) {
+          if constexpr (kHasFlushScale) {
+            // Every flush group (kScaleK <= 128) or chunk (kScaleK > 128: the group scale is
+            // constant across its chunks) gets a fresh accumulator, scaled into regs_c at once.
+            Acc acc{};
+            PRAGMA_UNROLL
+            for (uint32_t u = 0; u < kUnitsPerFlush; u++) mma(stage, a_flush[u], b_flush[tile_n][u], acc, tile_m, tile_n);
+            PRAGMA_UNROLL
+            for (uint32_t r = 0; r < 4; r++) {
+              const float scale = kAsFlush ? ws[tile_n] * as_f[r] : ws[tile_n];
+              regs_c[tile_m][tile_n][r] += static_cast<float>(acc[r]) * scale;
+            }
+          } else if constexpr (kIsInt8) {
+            // INT32 accumulator, converted at the end.
+            PRAGMA_UNROLL
+            for (uint32_t u = 0; u < kUnitsPerFlush; u++) mma(stage, a_flush[u], b_flush[tile_n][u], regs_part[tile_m][tile_n], tile_m, tile_n);
+          } else {
+            PRAGMA_UNROLL
+            for (uint32_t u = 0; u < kUnitsPerFlush; u++) mma(stage, a_flush[u], b_flush[tile_n][u], regs_c[tile_m][tile_n], tile_m, tile_n);
+          }
+        }
+      }
     }
   }
 
@@ -455,7 +486,7 @@ struct MfmaF8Gemm {
       PRAGMA_UNROLL
       for (uint32_t tile_n = 0; tile_n < kTilesN; tile_n++) {
         regs_c[tile_m][tile_n] = mfma_f32x4_t{};
-        regs_part[tile_m][tile_n] = Acc{};
+        if constexpr (kIsInt8 && !kHasFlushScale) regs_part[tile_m][tile_n] = Acc{};
       }
     }
 
@@ -477,15 +508,15 @@ struct MfmaF8Gemm {
         constexpr uint32_t load_stage = (stage + kStages - 1) % kStages;
         load_chunk(load_stage, MIN(chunk_begin + base + stage + kStages - 1, last_chunk));
         __builtin_amdgcn_sched_barrier(0);
-        compute_chunk(stage, chunk_begin + base + stage, chunk_end, lut);
+        compute_chunk(stage, chunk_begin + base + stage, lut);
       });
     }
     static_for<0, kStages - 1>([&](auto stage_constant) {
       constexpr uint32_t stage = decltype(stage_constant)::value;
-      if (base + stage < num_iters) compute_chunk(stage, chunk_begin + base + stage, chunk_end, lut);
+      if (base + stage < num_iters) compute_chunk(stage, chunk_begin + base + stage, lut);
     });
 
-    if constexpr (!kHasFlushScale) flush(0, 0, false);
+    if constexpr (kIsInt8 && !kHasFlushScale) flush_int8();
   }
 
   template <class Func>
@@ -527,11 +558,26 @@ __global__ __launch_bounds__(TileConfig::kNumThreads, 2) void humming_mfma_f8(
   const uint32_t warp_m = warp_id / TileConfig::kWarpsN;
   const uint32_t warp_n = warp_id % TileConfig::kWarpsN;
 
+  // Block -> output tile order, for L2 reuse: the hardware hands consecutive blocks to the 8 XCDs
+  // in turn, so blocks on one XCD are first made contiguous, then grouped kGroupM M tiles at a
+  // time (consecutive blocks share A rows and, across a group, B columns).
+  constexpr uint32_t kXcds = 8;
+  constexpr uint32_t kGroupM = 8;
+  const uint32_t num_tiles_n = gridDim.x;
+  const uint32_t num_tiles_m = gridDim.y;
+  const uint32_t num_xy = num_tiles_n * num_tiles_m;
+  uint32_t pid = blockIdx.y * num_tiles_n + blockIdx.x;
+  if (num_xy % kXcds == 0) pid = pid % kXcds * (num_xy / kXcds) + pid / kXcds;
+  const uint32_t group_first_m = pid / (kGroupM * num_tiles_n) * kGroupM;
+  const uint32_t group_rows = MIN(num_tiles_m - group_first_m, kGroupM);
+  const uint32_t block_tile_m = group_first_m + pid % (kGroupM * num_tiles_n) % group_rows;
+  const uint32_t block_tile_n = pid % (kGroupM * num_tiles_n) / group_rows;
+
   __shared__ mfma_u32x4_t lds_a[TileConfig::kLdsA ? 2 * Gemm::kLdsBufferUnits : 1];
   Gemm gemm;
   gemm.lds_a = lds_a;
   gemm.thread_id = threadIdx.x;
-  gemm.block_m_offset = blockIdx.y * TileConfig::kBlockM;
+  gemm.block_m_offset = block_tile_m * TileConfig::kBlockM;
   gemm.local_m_offset = warp_m * TileConfig::kWarpTilesM * 16;
   gemm.a_ptr = A;
   gemm.b_ptr = B;
@@ -543,8 +589,8 @@ __global__ __launch_bounds__(TileConfig::kNumThreads, 2) void humming_mfma_f8(
   gemm.shape_n = shape_n;
   gemm.shape_k = shape_k;
   gemm.lane = threadIdx.x % kWaveSize;
-  gemm.m_offset = blockIdx.y * TileConfig::kBlockM + warp_m * TileConfig::kWarpTilesM * 16;
-  gemm.n_tile_offset = (blockIdx.x * TileConfig::kBlockN + warp_n * TileConfig::kWarpTilesN * 16) / 16;
+  gemm.m_offset = block_tile_m * TileConfig::kBlockM + warp_m * TileConfig::kWarpTilesM * 16;
+  gemm.n_tile_offset = (block_tile_n * TileConfig::kBlockN + warp_n * TileConfig::kWarpTilesN * 16) / 16;
 
   const uint32_t num_chunks_k = shape_k / Gemm::kChunkK;
   const uint32_t num_splits = gridDim.z;

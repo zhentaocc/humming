@@ -402,12 +402,17 @@ def test_cuda_graph_capture(gemm_type, num_tokens):
 # Helpers
 
 
-@pytest.mark.parametrize("num_tokens", [0, 1, 5, 64, 1000])
+ALIGN_IMPLS = [ops.moe_align_block_size, ops.moe_align_block_size_torch]
+ALIGN_IDS = ["hip", "torch"]
+
+
+@pytest.mark.parametrize("align", ALIGN_IMPLS, ids=ALIGN_IDS)
+@pytest.mark.parametrize("num_tokens", [0, 1, 5, 64, 1000, 8192])
 @pytest.mark.parametrize(("num_experts", "top_k", "block_size"), [(8, 2, 16), (64, 8, 32), (256, 8, 128)])
-def test_moe_align_block_size(num_tokens, num_experts, top_k, block_size):
+def test_moe_align_block_size(align, num_tokens, num_experts, top_k, block_size):
     topk_ids = random_topk_ids(num_tokens, num_experts, top_k) if num_tokens else torch.empty(
         0, top_k, dtype=torch.int32, device="cuda")
-    sorted_ids, expert_ids, num_tokens_padded = ops.moe_align_block_size(topk_ids, block_size, num_experts)
+    sorted_ids, expert_ids, num_tokens_padded = align(topk_ids, block_size, num_experts)
     numel = topk_ids.numel()
     # Same buffer sizes as vLLM's moe_align_block_size.
     max_padded = numel + num_experts * (block_size - 1)
@@ -430,6 +435,56 @@ def test_moe_align_block_size(num_tokens, num_experts, top_k, block_size):
     assert (sorted_ids[used:] == numel).all()
     seen = torch.cat(seen) if seen else torch.empty(0, dtype=torch.int32)
     assert sorted(seen.tolist()) == list(range(numel))
+
+
+def canonical_alignment(sorted_ids, expert_ids, num_tokens_padded, block_size):
+    """Sort the row ids inside every run of same-expert blocks (the HIP kernel does not fix the
+    order of rows inside an expert; padding sorts last since it equals numel)."""
+    sorted_ids, expert_ids = sorted_ids.long().cpu(), expert_ids.cpu()
+    if expert_ids.numel():
+        run = torch.cat([torch.zeros(1, dtype=torch.long), (expert_ids[1:] != expert_ids[:-1]).long()]).cumsum(0)
+        key = run.repeat_interleave(block_size) * (1 << 32) + sorted_ids
+        sorted_ids = sorted_ids[key.argsort()]
+    return sorted_ids, expert_ids, int(num_tokens_padded)
+
+
+@pytest.mark.parametrize("ids_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("map_mode", ["none", "keep", "ignore"])
+@pytest.mark.parametrize(("num_tokens", "num_experts", "top_k", "block_size"),
+                         [(1, 8, 2, 16), (3, 256, 8, 16), (77, 64, 6, 32), (4096, 128, 8, 64), (513, 1024, 4, 16)])
+def test_moe_align_hip_matches_torch(ids_dtype, map_mode, num_tokens, num_experts, top_k, block_size):
+    """HIP align == torch align (up to the row order inside an expert): expert_map, int64, invalid ids."""
+    topk_ids = random_topk_ids(num_tokens, num_experts, top_k).to(ids_dtype)
+    topk_ids.view(-1)[::7] = -1  # invalid (e.g. masked-out) routes are dropped
+    expert_map = None
+    if map_mode != "none":
+        expert_map = torch.full((num_experts,), -1, dtype=torch.int32, device="cuda")
+        local = num_experts // 2
+        expert_map[num_experts // 4:num_experts // 4 + local] = torch.arange(local, dtype=torch.int32, device="cuda")
+    ignore = map_mode == "ignore"
+    hip = ops.moe_align_block_size(topk_ids, block_size, num_experts, expert_map, ignore)
+    ref = ops.moe_align_block_size_torch(topk_ids, block_size, num_experts, expert_map, ignore)
+    hip, ref = canonical_alignment(*hip, block_size), canonical_alignment(*ref, block_size)
+    assert hip[2] == ref[2]
+    assert torch.equal(hip[1], ref[1])
+    assert torch.equal(hip[0], ref[0])
+
+
+def test_moe_align_cuda_graph():
+    """The HIP align replays inside a CUDA graph on new routing."""
+    num_tokens, num_experts, top_k, block_size = 300, 64, 8, 32
+    topk_ids = random_topk_ids(num_tokens, num_experts, top_k)
+    ops.moe_align_block_size(topk_ids, block_size, num_experts)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        outputs = ops.moe_align_block_size(topk_ids, block_size, num_experts)
+    for _ in range(3):
+        topk_ids.copy_(random_topk_ids(num_tokens, num_experts, top_k))
+        graph.replay()
+        ref = ops.moe_align_block_size_torch(topk_ids, block_size, num_experts)
+        torch.cuda.synchronize()
+        got, want = canonical_alignment(*outputs, block_size), canonical_alignment(*ref, block_size)
+        assert got[2] == want[2] and torch.equal(got[1], want[1]) and torch.equal(got[0], want[0])
 
 
 def test_heuristics_block_m_matches_between_sublayers():

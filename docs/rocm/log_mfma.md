@@ -146,6 +146,32 @@ Measurement note: GPU 4 sits on a shared node. Whole runs were intermittently 2-
 slower for both our kernel and torch, with no visible GPU 4 load. The benchmark now takes
 the best of 5 timing windows, and the final tables are the per-row minimum of three runs.
 
+## Iteration 9: bf16 through the fp16 dequant + `launch_bounds(…, 2)`
+
+The bf16 1,4,8,2 loop cost about 6.4 VALU per B value. Humming's bf16 `__hsub2` and the
+scale both went through fp32 add/mul, because gfx950 has no packed bf16 math.
+Now bf16 uses Humming's fp16 dequant (exact for <= 10-bit codes), then:
+1. `v_cvt_f32_f16` on each half
+2. `v_pk_mul_f32` by the group scale (scale_b)
+3. `v_cvt_pk_bf16_f32`
+
+This removes the bf16-only 7/8-bit fork.
+
+The first build allocated 170 VGPR + 96 AGPR (266 > 256), which means occupancy 1.
+`__launch_bounds__(256, 2)` brings it to 204 unified registers with no spills.
+A/B on fp16 showed no change (124 VGPR before, same loop).
+
+28672x8192 bf16 int4 g128 (torch fp16 baseline):
+
+| M | before us | after us | speedup vs torch |
+|---|---|---|---|
+| 1 | ~34 | 32.9 | 2.85x |
+| 64 | ~69 | 55.1 | 1.77x |
+| 255 | 208.6 | 147.3 | 0.91x |
+| 1024 | 722.9 | 512.9 | 0.70x |
+
+The bf16 large-shape correctness matrix is unchanged, with max rel err <= 3.9e-3.
+
 ## Further ideas (not done)
 
 - Large M is VALU-bound: about 1.9 VALU ops per 16-cycle MFMA at 2 waves/SIMD, and
@@ -154,8 +180,8 @@ the best of 5 timing windows, and the final tables are the per-row minimum of th
     the 48 `lshr`.
   - 32x32x16 MFMA halves the LDS A reads per flop.
   - `global_load_lds` (direct-to-LDS) for A would free the VGPR staging.
-- bf16: no packed bf16 multiply on gfx950, so scale_b goes through fp32. An fp32-fused
-  scaling path (scale in the dequant FMA) would help bf16 group-wise.
+- bf16 is still 0.70x at M=1024: three conversions per 2 values. Dequantizing straight to bf16 bit
+  patterns (shift into the exponent field) for the symmetric case would drop the cvts.
 - M=1 reaches ~4.2 TB/s (torch fp16 ~5.3 TB/s on the same pattern). More bytes in flight
   per CU (wider tiles_n with deeper stages and split-K) is the lever, but occupancy is
   already VGPR-limited.

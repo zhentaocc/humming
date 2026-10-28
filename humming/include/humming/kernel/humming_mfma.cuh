@@ -210,50 +210,62 @@ struct MfmaWeightOnlyGemm {
     return clamped_n_tile(tile_n) * 16 + Op::c_col(lane);
   }
 
+  // All loads are raw buffer loads (see mfma_buffer_load): the descriptor holds a
+  // wave/block-uniform base, the per-lane offset is loop invariant and the per-chunk
+  // step goes into the SGPR soffset, so the address math leaves the VALU.
+  CUDA_INLINE uint32_t first_n_tile() const {
+    return MIN(n_tile_offset, shape_n / 16 - 1);
+  }
+
   CUDA_INLINE void load_chunk(uint32_t stage, uint32_t chunk_k) {
     const uint32_t num_chunks_k = shape_k / kChunkK;
+    constexpr uint32_t kChunkBytesB = kWaveSize * kBits * 4;
+    const auto rsrc_b = mfma_make_buffer(b_ptr + static_cast<size_t>(first_n_tile()) * num_chunks_k * kWaveSize * kBits);
     PRAGMA_UNROLL
     for (uint32_t tile_n = 0; tile_n < kTilesN; tile_n++) {
-      const size_t chunk_index = static_cast<size_t>(clamped_n_tile(tile_n)) * num_chunks_k + chunk_k;
-      const uint32_t *src = b_ptr + (chunk_index * kWaveSize + lane) * kBits;
-      if constexpr (kBits % 4 == 0) {
-        PRAGMA_UNROLL
-        for (uint32_t i = 0; i < kBits / 4; i++) {
-          *reinterpret_cast<mfma_u32x4_t *>(&regs_qb[stage][tile_n][i * 4]) = reinterpret_cast<const mfma_u32x4_t *>(src)[i];
-        }
-      } else {
-        PRAGMA_UNROLL
-        for (uint32_t i = 0; i < kBits; i++) regs_qb[stage][tile_n][i] = src[i];
-      }
+      const uint32_t voffset = ((clamped_n_tile(tile_n) - first_n_tile()) * num_chunks_k * kWaveSize + lane) * kBits * 4;
+      static_for<0, (kBits + 3) / 4>([&](auto part) {
+        constexpr uint32_t i = decltype(part)::value * 4;
+        mfma_buffer_load<MIN(kBits - i, 4)>(rsrc_b, voffset + i * 4, chunk_k * kChunkBytesB, &regs_qb[stage][tile_n][i]);
+      });
 
       if constexpr (!kIsChannelScale) {
+        const auto rsrc_bs = mfma_make_buffer(bs_ptr);
         PRAGMA_UNROLL
         for (uint32_t group = 0; group < kGroupsPerChunk; group++) {
           const uint32_t group_index = (chunk_k * kChunkK + group * MIN(kGroupSize, kChunkK)) / kGroupSize;
-          const size_t offset = static_cast<size_t>(group_index) * shape_n + clamped_column(tile_n);
-          regs_bs[stage][tile_n][group] = bs_ptr[offset];
-          if constexpr (kHasZeroPoint) regs_bzp[stage][tile_n][group] = bzp_ptr[offset];
+          const uint32_t column_offset = clamped_column(tile_n);
+          regs_bs[stage][tile_n][group] =
+              __builtin_amdgcn_raw_buffer_load_b16(rsrc_bs, column_offset * 2, group_index * shape_n * 2, 0);
+          if constexpr (kHasZeroPoint) {
+            const auto rsrc_bzp = mfma_make_buffer(bzp_ptr);
+            regs_bzp[stage][tile_n][group] =
+                __builtin_amdgcn_raw_buffer_load_b8(rsrc_bzp, column_offset, group_index * shape_n, 0);
+          }
         }
       }
     }
 
+    // A rows past M re-read row M - 1: A row r only feeds C row r, which is not stored.
+    const auto rsrc_a = mfma_make_buffer(a_ptr + static_cast<size_t>(block_m_offset) * shape_k);
+    const uint32_t soffset_a = chunk_k * kChunkK * 2;
     if constexpr (kLdsA) {
       PRAGMA_UNROLL
       for (uint32_t i = 0; i < kLdsAUnits; i++) {
         const uint32_t unit_index = thread_id + i * TileConfig::kNumThreads;
-        const uint32_t row = MIN(block_m_offset + unit_index / 16, shape_m - 1);
-        const uint16_t *src = a_ptr + static_cast<size_t>(row) * shape_k + chunk_k * kChunkK + unit_index % 16 * 8;
-        regs_a_share[stage][i] = *reinterpret_cast<const mfma_u32x4_t *>(src);
+        const uint32_t row = MIN(block_m_offset + unit_index / 16, shape_m - 1) - block_m_offset;
+        const uint32_t voffset = (row * shape_k + unit_index % 16 * 8) * 2;
+        regs_a_share[stage][i] = __builtin_amdgcn_raw_buffer_load_b128(rsrc_a, voffset, soffset_a, 0);
       }
     } else {
       PRAGMA_UNROLL
       for (uint32_t tile_m = 0; tile_m < kTilesM; tile_m++) {
-        // Rows past M re-read row M - 1: A row r only feeds C row r, which is not stored.
-        const uint32_t row = MIN(m_offset + tile_m * 16 + Op::a_row(lane), shape_m - 1);
-        const uint16_t *src = a_ptr + static_cast<size_t>(row) * shape_k + chunk_k * kChunkK + Op::ab_k(lane, 0);
+        const uint32_t row = MIN(m_offset + tile_m * 16 + Op::a_row(lane), shape_m - 1) - block_m_offset;
+        const uint32_t voffset = (row * shape_k + Op::ab_k(lane, 0)) * 2;
         PRAGMA_UNROLL
         for (uint32_t mfma_index = 0; mfma_index < kMfmaPerChunk; mfma_index++) {
-          regs_a[stage][tile_m][mfma_index] = *reinterpret_cast<const mfma_u32x4_t *>(src + mfma_index * Op::K);
+          regs_a[stage][tile_m][mfma_index] =
+              __builtin_amdgcn_raw_buffer_load_b128(rsrc_a, voffset + mfma_index * Op::K * 2, soffset_a, 0);
         }
       }
     }
@@ -372,6 +384,9 @@ struct MfmaWeightOnlyGemm {
         constexpr uint32_t stage = decltype(stage_constant)::value;
         constexpr uint32_t load_stage = (stage + kStages - 1) % kStages;
         load_chunk(load_stage, MIN(chunk_begin + base + stage + kStages - 1, last_chunk));
+        // Keep the prefetch issued ahead of this chunk's math; otherwise the scheduler
+        // sinks the loads to the end of the unrolled body and the pipeline gets shallower.
+        __builtin_amdgcn_sched_barrier(0);
         compute_chunk(stage, chunk_begin + base + stage, channel_zero_points);
       });
     }
@@ -438,7 +453,9 @@ __global__ __launch_bounds__(TileConfig::kNumThreads) void humming_mfma(
     uint32_t shape_n,
     uint32_t shape_k) {
   using Gemm = MfmaWeightOnlyGemm<ElementA, ElementQB, TileConfig, kGroupSize, kHasZeroPoint>;
-  const uint32_t warp_id = threadIdx.x / kWaveSize;
+  // readfirstlane: tells the compiler the wave index is uniform, so buffer descriptors
+  // derived from it stay in SGPRs (otherwise it emits a waterfall loop per load).
+  const uint32_t warp_id = __builtin_amdgcn_readfirstlane(threadIdx.x / kWaveSize);
   const uint32_t warp_m = warp_id / TileConfig::kWarpsN;
   const uint32_t warp_n = warp_id % TileConfig::kWarpsN;
 
@@ -476,19 +493,38 @@ __global__ __launch_bounds__(TileConfig::kNumThreads) void humming_mfma(
   //
   // An agent-scope release/acquire fence on gfx950 is a full L2 writeback + invalidate
   // (buffer_wbl2 sc1 / buffer_inv sc1, L2 is per XCD), which cost ~4 us per split. Instead
-  // every partial is itself an agent-scope (relaxed atomic) store/load, which is coherent
-  // across XCDs on its own; we only have to make sure the stores have completed
-  // (s_waitcnt vmcnt(0), gfx9 counts stores in vmcnt) before the counter increment.
-  const size_t split_stride = static_cast<size_t>(shape_m) * shape_n;
-  gemm.for_each_output([&](uint32_t row, uint32_t col, float value) {
-    float *ptr = &workspace[blockIdx.z * split_stride + static_cast<size_t>(row) * shape_n + col];
-    __hip_atomic_store(ptr, value, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-  });
+  // every partial is stored / loaded with the sc1 cache policy (what agent-scope atomics
+  // use), which is coherent across XCDs on its own; we only have to make sure the stores
+  // have completed (s_waitcnt vmcnt(0), gfx9 counts stores in vmcnt) before the counter
+  // increment.
+  //
+  // Partials keep the accumulator fragment layout, [split][tile][tile_m][tile_n][thread]
+  // of 16 bytes: every store/load is a fully coalesced dwordx4, and the last block adds
+  // the other splits straight into its registers.
+  constexpr uint32_t kTileFloats = TileConfig::kBlockM * TileConfig::kBlockN;
+  constexpr uint32_t kSc1 = 16;  // gfx940+ CPol::SC1
+  const uint32_t tile_id = blockIdx.y * gridDim.x + blockIdx.x;
+  const uint32_t num_tiles = gridDim.x * gridDim.y;
+  auto fragment_offset = [&](uint32_t tile_m, uint32_t tile_n) {
+    return ((tile_m * Gemm::kTilesN + tile_n) * TileConfig::kNumThreads + threadIdx.x) * 16;
+  };
+  auto split_buffer = [&](uint32_t split) {
+    return mfma_make_buffer(workspace + (static_cast<size_t>(split) * num_tiles + tile_id) * kTileFloats, kTileFloats * 4);
+  };
+  {
+    const auto rsrc = split_buffer(blockIdx.z);
+    PRAGMA_UNROLL
+    for (uint32_t tile_m = 0; tile_m < Gemm::kTilesM; tile_m++) {
+      PRAGMA_UNROLL
+      for (uint32_t tile_n = 0; tile_n < Gemm::kTilesN; tile_n++) {
+        __builtin_amdgcn_raw_buffer_store_b128(gemm.regs_c[tile_m][tile_n], rsrc, fragment_offset(tile_m, tile_n), 0, kSc1);
+      }
+    }
+  }
   __builtin_amdgcn_s_waitcnt(0x0F70);  // vmcnt(0) expcnt(7) lgkmcnt(15)
   __syncthreads();
 
   __shared__ uint32_t is_last_block;
-  const uint32_t tile_id = blockIdx.y * gridDim.x + blockIdx.x;
   if (threadIdx.x == 0) {
     uint32_t arrived = __hip_atomic_fetch_add(&tile_counters[tile_id], 1u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
     is_last_block = arrived == num_splits - 1;
@@ -496,13 +532,32 @@ __global__ __launch_bounds__(TileConfig::kNumThreads) void humming_mfma(
   __syncthreads();
   if (!is_last_block) return;
 
-  gemm.for_each_output([&](uint32_t row, uint32_t col, float) {
-    const size_t offset = static_cast<size_t>(row) * shape_n + col;
-    float sum = 0.0f;
+  // Re-read this block's own partial too: keeping regs_c live next to the incoming
+  // partials raises the kernel's VGPR peak (and halves occupancy for large tiles).
+  // Steps of kRowsPerStep fragment rows bound the epilogue registers; every load of a row,
+  // across all splits, is in flight at once.
+  constexpr uint32_t kRowsPerStep = MIN(Gemm::kTilesM, 4u);
+  PRAGMA_UNROLL
+  for (uint32_t tile_m_base = 0; tile_m_base < Gemm::kTilesM; tile_m_base += kRowsPerStep) {
+    typename Gemm::CRegisters sums[kRowsPerStep][Gemm::kTilesN] = {};
     for (uint32_t split = 0; split < num_splits; split++) {
-      sum += __hip_atomic_load(&workspace[split * split_stride + offset], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+      const auto rsrc = split_buffer(split);
+      PRAGMA_UNROLL
+      for (uint32_t i = 0; i < kRowsPerStep; i++) {
+        PRAGMA_UNROLL
+        for (uint32_t tile_n = 0; tile_n < Gemm::kTilesN; tile_n++) {
+          sums[i][tile_n] += __builtin_amdgcn_raw_buffer_load_b128(rsrc, fragment_offset(tile_m_base + i, tile_n), 0, kSc1);
+        }
+      }
     }
-    C[offset] = mfma_float_to_half<ElementA>(sum);
+    PRAGMA_UNROLL
+    for (uint32_t i = 0; i < kRowsPerStep; i++) {
+      PRAGMA_UNROLL
+      for (uint32_t tile_n = 0; tile_n < Gemm::kTilesN; tile_n++) gemm.regs_c[tile_m_base + i][tile_n] = sums[i][tile_n];
+    }
+  }
+  gemm.for_each_output([&](uint32_t row, uint32_t col, float value) {
+    C[static_cast<size_t>(row) * shape_n + col] = mfma_float_to_half<ElementA>(value);
   });
   if (threadIdx.x == 0) tile_counters[tile_id] = 0;
 }

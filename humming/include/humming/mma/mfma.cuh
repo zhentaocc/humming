@@ -29,6 +29,31 @@ using mfma_u32x4_t = uint32_t __attribute__((ext_vector_type(4)));
 
 constexpr uint32_t kWaveSize = 64;
 
+// Raw buffer loads: a scalar base in the resource descriptor, a 32-bit per-lane `voffset`
+// and a wave-uniform `soffset` (SGPR). Compared with flat/global loads, the per-chunk
+// address step costs no 64-bit VALU math. Word 3 = 0x00020000 matches CK for gfx9 CDNA.
+CUDA_INLINE __amdgpu_buffer_rsrc_t mfma_make_buffer(const void *base, uint32_t num_bytes = 0xFFFFFFFFu) {
+  return __builtin_amdgcn_make_buffer_rsrc(const_cast<void *>(base), static_cast<short>(0), num_bytes, 0x00020000);
+}
+
+template <uint32_t kWords>
+CUDA_INLINE void mfma_buffer_load(__amdgpu_buffer_rsrc_t rsrc, uint32_t voffset, uint32_t soffset, uint32_t *dst) {
+  static_assert(kWords >= 1 && kWords <= 4);
+  if constexpr (kWords == 4) {
+    *reinterpret_cast<mfma_u32x4_t *>(dst) = __builtin_amdgcn_raw_buffer_load_b128(rsrc, voffset, soffset, 0);
+  } else if constexpr (kWords == 3) {
+    using u32x3 = uint32_t __attribute__((ext_vector_type(3)));
+    const u32x3 v = __builtin_amdgcn_raw_buffer_load_b96(rsrc, voffset, soffset, 0);
+    dst[0] = v.x, dst[1] = v.y, dst[2] = v.z;
+  } else if constexpr (kWords == 2) {
+    using u32x2 = uint32_t __attribute__((ext_vector_type(2)));
+    const u32x2 v = __builtin_amdgcn_raw_buffer_load_b64(rsrc, voffset, soffset, 0);
+    dst[0] = v.x, dst[1] = v.y;
+  } else {
+    dst[0] = __builtin_amdgcn_raw_buffer_load_b32(rsrc, voffset, soffset, 0);
+  }
+}
+
 template <class ElementA, uint32_t kShapeM>
 struct MfmaOp;
 

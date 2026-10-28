@@ -3,7 +3,7 @@
     HIP_VISIBLE_DEVICES=4 python -m tests.rocm.bench_mfma [--bits 4] [--group 128] [--zp] [--dtype fp16]
         [--check] [--ms 1,16,...] [--shapes 4096x4096,...]
 
-Timing uses HIP events around `iters` launches after `warmup` launches. Weight buffers
+Timing: HIP events around `iters` graph-captured launches after `warmup` launches, best of 5. Weight buffers
 are rotated across enough copies to exceed the 256 MB MALL so the numbers reflect HBM.
 Bytes = quantized weight + scales/zero points + activation + output.
 """
@@ -21,7 +21,7 @@ DEFAULT_SHAPES = [(4096, 4096), (11008, 4096), (4096, 11008), (8192, 28672), (28
 ROTATION_BYTES = 1 << 30
 
 
-def time_rotating(fn, num_buffers, warmup=10, iters=100):
+def time_rotating(fn, num_buffers, warmup=10, iters=100, repeats=5):
     """Average GPU time per call; calls are captured into a HIP graph so host launch
     overhead (ctypes + Python) does not leak into the measurement."""
     for i in range(warmup):
@@ -38,13 +38,17 @@ def time_rotating(fn, num_buffers, warmup=10, iters=100):
     graph.replay()
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
-    torch.cuda.synchronize()
-    start.record()
-    for _ in range(replays):
-        graph.replay()
-    end.record()
-    torch.cuda.synchronize()
-    return start.elapsed_time(end) * 1000.0 / (replays * calls_per_graph)
+    # The node is shared (other GPUs run production jobs): take the best of a few windows.
+    best = float("inf")
+    for _ in range(repeats):
+        torch.cuda.synchronize()
+        start.record()
+        for _ in range(replays):
+            graph.replay()
+        end.record()
+        torch.cuda.synchronize()
+        best = min(best, start.elapsed_time(end) * 1000.0 / (replays * calls_per_graph))
+    return best
 
 
 def num_copies(nbytes):

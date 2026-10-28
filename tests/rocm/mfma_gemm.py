@@ -104,18 +104,22 @@ def _get_workspace(device: torch.device, num_floats: int, num_counters: int) -> 
 
 def select_tile(shape_m: int, shape_n: int, shape_k: int, num_cus: int = 256) -> tuple[MfmaTile, int]:
     """Heuristic tile + split-K selection per M bucket (see docs/rocm/log_mfma.md)."""
-    if shape_m <= 16:
-        tile = MfmaTile(warps_m=1, warps_n=4, tiles_m=1, tiles_n=1, stages=4)
+    if shape_m <= 8:
+        # Decode: no LDS, one 16-row MFMA tile; wider N per wave only when N gives enough blocks.
+        tiles_n = 2 if shape_n // 128 >= num_cus // 2 else 1
+        tile = MfmaTile(warps_m=1, warps_n=4, tiles_m=1, tiles_n=tiles_n, stages=4)
     elif shape_m <= 32:
-        tile = MfmaTile(warps_m=1, warps_n=4, tiles_m=2, tiles_n=1, stages=4)
+        tile = MfmaTile(warps_m=1, warps_n=4, tiles_m=2, tiles_n=2, stages=2, lds_a=True, scale_b=True)
     elif shape_m <= 64:
-        tile = MfmaTile(warps_m=1, warps_n=4, tiles_m=4, tiles_n=1, stages=3)
+        tile = MfmaTile(warps_m=1, warps_n=4, tiles_m=4, tiles_n=2, stages=2, lds_a=True, scale_b=True)
     else:
-        tile = MfmaTile(warps_m=2, warps_n=2, tiles_m=4, tiles_n=2, stages=2)
+        tile = MfmaTile(warps_m=1, warps_n=4, tiles_m=8, tiles_n=2, stages=2, lds_a=True, scale_b=True)
     num_blocks = math.ceil(shape_n / tile.block_n) * math.ceil(shape_m / tile.block_m)
     num_chunks_k = shape_k // 128
+    # Split-K until about one block per CU (the kernel needs >= 1 wave per SIMD to keep
+    # loads in flight); each split keeps >= 4 K chunks.
     num_splits = 1
-    while num_blocks * num_splits < 2 * num_cus and num_chunks_k // (num_splits * 2) >= 4:
+    while num_blocks * num_splits < num_cus and num_splits < 8 and num_chunks_k // (num_splits * 2) >= 4:
         num_splits *= 2
     return tile, num_splits
 
@@ -153,7 +157,8 @@ def mfma_gemm(
         return outputs
 
     num_tiles = math.ceil(shape_n / tile.block_n) * math.ceil(shape_m / tile.block_m)
-    workspace, counters = _get_workspace(inputs.device, num_splits * shape_m * shape_n, num_tiles)
+    # Split-K partials: [split][output tile][block_m * block_n] in accumulator fragment order.
+    workspace, counters = _get_workspace(inputs.device, num_splits * num_tiles * tile.block_m * tile.block_n, num_tiles)
     key = MfmaKernelKey(inputs.dtype, num_bits, group_size, zero_point is not None, tile)
     launch = _load_kernel(key)
     status = launch(

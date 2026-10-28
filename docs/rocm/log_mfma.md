@@ -94,3 +94,69 @@ Dead ends: 2,2,8,2 (128 KB LDS, occupancy 1) and 1,4,4,4,2,lds,sb (174 VGPR + 88
 occupancy 1) both ran about 2x slower at M=1024.
 Remaining VALU per 128 MFMAs in the 1,4,8,2 loop: 64 bitop3, 64 pk_add, 64 pk_mul,
 48 lshr, about 34 64-bit address ops (`v_lshl_add_u64`).
+
+## Iteration 6: buffer loads
+
+All loads are `raw_buffer_load`s now. The descriptor holds the per-wave (B) or per-block
+(A) base, the lane offset is loop invariant, and the per-chunk step goes into the SGPR
+`soffset`. This removed every `v_lshl_add_u64` from the main loop. The 1,4,8,2 loop is
+now 240 VALU per 128 MFMAs: 64 bitop3, 64 pk_add, 64 pk_mul, 48 lshr.
+Gotcha: `threadIdx.x / 64` is not provably wave-uniform, so descriptors built from the
+wave index became a waterfall loop (readfirstlane + cmp + saveexec around every load).
+Fixed with `__builtin_amdgcn_readfirstlane` on the wave index.
+Gain: 1-7% (e.g. M=1024 28672x8192 482 -> 477 us; M=16 1,4,4,2: 53.5 -> 49.6 us).
+Address math was not the main limiter.
+
+## Iteration 7: keep the prefetch ahead of the math (`sched_barrier`)
+
+The machine scheduler sank the next stage's loads to the end of the unrolled loop body,
+so waits were `vmcnt(4..12)` and the register pipeline was effectively shallow. A
+`__builtin_amdgcn_sched_barrier(0)` after each `load_chunk` keeps 40+ loads in flight.
+4096x4096 M=1 (x1): 14.9 -> 12.1 us. Large M unchanged.
+
+## Iteration 8: split-K partials in fragment layout
+
+At mid M, split-K was a big loss: 4096x4096 M=255 took 41 us at x1, 53 us at x2 and
+70 us at x4. The reduction read row-major 4-byte agent-scope atomics in a runtime loop
+behind a per-element branch, so the loads were serialized.
+Partials are now stored in the accumulator fragment layout
+([split][tile][tile_m][tile_n][thread] x 16 B) with sc1 `buffer_store_dwordx4` (fully
+coalesced). The last block sums all splits with independent sc1 dwordx4 loads, one
+row of fragments at a time.
+Dead end: adding the partials into the live `regs_c` pushed VGPRs from 136 to 210 and
+dropped the 1,4,8,2 tile to occupancy 1. Summing into fresh registers (re-reading its own
+partial) keeps 124 VGPRs.
+
+| 4096x4096 | old x4 | new, best split |
+|---|---|---|
+| M=64 | 33.8 us | 12.6 us (x8; torch 13.0) |
+| M=255 | 70.3 us | 21.8 us (x4; torch 22.2) |
+
+`select_tile` changes:
+- M<=8: 1,4,1,{1,2},4 (no LDS)
+- M<=32: 1,4,2,2,2,lds,sb
+- M<=64: 1,4,4,2,2,lds,sb
+- else: 1,4,8,2,2,lds,sb
+- Split-K doubles (up to 8) until there is about one block per CU.
+
+Tried and reverted: targeting two blocks per CU for long K helped 8192x28672 M=255
+(148 -> 132 us) but hurt 28672x8192 M=255 (132 -> 142 us).
+
+Measurement note: GPU 4 sits on a shared node. Whole runs were intermittently 2-8x
+slower for both our kernel and torch, with no visible GPU 4 load. The benchmark now takes
+the best of 5 timing windows, and the final tables are the per-row minimum of three runs.
+
+## Further ideas (not done)
+
+- Large M is VALU-bound: about 1.9 VALU ops per 16-cycle MFMA at 2 waves/SIMD, and
+  hipBLASLt is 1.25-1.3x faster at M=1024.
+  - A Marlin-style shift-free int4 dequant (mask 0x00F000F0 + pk_fma with 1/16) would drop
+    the 48 `lshr`.
+  - 32x32x16 MFMA halves the LDS A reads per flop.
+  - `global_load_lds` (direct-to-LDS) for A would free the VGPR staging.
+- bf16: no packed bf16 multiply on gfx950, so scale_b goes through fp32. An fp32-fused
+  scaling path (scale in the dequant FMA) would help bf16 group-wise.
+- M=1 reaches ~4.2 TB/s (torch fp16 ~5.3 TB/s on the same pattern). More bytes in flight
+  per CU (wider tiles_n with deeper stages and split-K) is the lever, but occupancy is
+  already VGPR-limited.
+- A split-K stream-K variant would avoid the fixed 1/2/4/8 quantization of work per CU.

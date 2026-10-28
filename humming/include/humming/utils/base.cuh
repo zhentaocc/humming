@@ -1,6 +1,10 @@
 #pragma once
 #include <cstdint>
-#include <cuda.h>
+#if defined(__HIP__)
+  #include <humming/utils/rocm/compat.cuh>
+#else
+  #include <cuda.h>
+#endif
 
 
 #ifndef USE_PPU
@@ -70,7 +74,11 @@ CUDA_INLINE void debug_kernel_timeout_check(
 
 template <typename T>
 CUDA_INLINE uint32_t cast_smem_ptr_to_uint(T *smem_ptr) {
+#if defined(__HIP__)
+  return static_cast<uint32_t>(reinterpret_cast<uintptr_t>((__attribute__((address_space(3))) T *)smem_ptr));
+#else
   return static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+#endif
 };
 
 constexpr uint32_t static_next_power_of_2(uint32_t v) {

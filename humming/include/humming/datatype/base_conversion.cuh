@@ -1,8 +1,10 @@
 #pragma once
 
-#include <cuda_bf16.h>
-#include <cuda_fp16.h>
-#include <cuda_fp8.h>
+#if !defined(__HIP__)
+  #include <cuda_bf16.h>
+  #include <cuda_fp16.h>
+  #include <cuda_fp8.h>
+#endif
 #include <humming/datatype/dtypes.cuh>
 #include <humming/utils/all.cuh>
 

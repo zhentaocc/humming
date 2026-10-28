@@ -64,9 +64,9 @@ def select_tile(shape_m: int, shape_n: int, num_cus: int, is_bfloat16: bool = Fa
         tiles_n = 2 if shape_n // 128 >= num_cus // 2 else 1
         return MfmaTile(tiles_m=1, tiles_n=tiles_n, stages=4)
     if shape_m <= 32:
-        return MfmaTile(tiles_m=2, tiles_n=2, stages=2, lds_a=True, scale_b=True)
+        return MfmaTile(tiles_m=2, tiles_n=2, stages=3, lds_a=True, scale_b=True)
     if shape_m <= 64:
-        return MfmaTile(tiles_m=4, tiles_n=2, stages=2, lds_a=True, scale_b=True)
+        return MfmaTile(tiles_m=4, tiles_n=2, stages=3, lds_a=True, scale_b=True)
     if not is_bfloat16 and shape_m > wide_tile_min_m(shape_n, num_cus):
         return MfmaTile(tiles_m=8, tiles_n=4, stages=2, lds_a=True, scale_b=True)
     return MfmaTile(tiles_m=8, tiles_n=2, stages=2, lds_a=True, scale_b=True)

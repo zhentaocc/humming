@@ -112,9 +112,9 @@ def select_tile(
         tiles_n = 2 if shape_n // 128 >= num_cus // 2 else 1
         tile = MfmaTile(warps_m=1, warps_n=4, tiles_m=1, tiles_n=tiles_n, stages=4)
     elif shape_m <= 32:
-        tile = MfmaTile(warps_m=1, warps_n=4, tiles_m=2, tiles_n=2, stages=2, lds_a=True, scale_b=True)
+        tile = MfmaTile(warps_m=1, warps_n=4, tiles_m=2, tiles_n=2, stages=3, lds_a=True, scale_b=True)
     elif shape_m <= 64:
-        tile = MfmaTile(warps_m=1, warps_n=4, tiles_m=4, tiles_n=2, stages=2, lds_a=True, scale_b=True)
+        tile = MfmaTile(warps_m=1, warps_n=4, tiles_m=4, tiles_n=2, stages=3, lds_a=True, scale_b=True)
     elif not is_bfloat16 and shape_m > gfx950.wide_tile_min_m(shape_n, num_cus):
         tile = MfmaTile(warps_m=1, warps_n=4, tiles_m=8, tiles_n=4, stages=2, lds_a=True, scale_b=True)
     else:

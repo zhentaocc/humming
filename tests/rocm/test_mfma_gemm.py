@@ -51,6 +51,8 @@ def test_small_shapes(dtype, num_bits, group_size, has_zero_point, shape_m):
         MfmaTile(1, 4, 2, 2, 3, lds_a=True),
         MfmaTile(1, 4, 8, 2, 2, lds_a=True, scale_b=True),
         MfmaTile(1, 4, 8, 4, 2, lds_a=True, scale_b=True),
+        MfmaTile(1, 4, 2, 2, 3, lds_a=True, scale_b=True),
+        MfmaTile(1, 4, 4, 2, 3, lds_a=True, scale_b=True),
     ],
 )
 @pytest.mark.parametrize("num_splits", [1, 2, 3, 8])

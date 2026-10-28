@@ -348,7 +348,8 @@ class HIPCCCompiler(Compiler):
             "--no-gpu-bundle-output",
             f"--offload-arch={sm_version}",
             "-std=c++17",
-            "-O3",
+            # HUMMING_HIPCC_OPT_LEVEL=0 is a debugging aid to rule out optimizer miscompiles.
+            f"-O{os.environ.get('HUMMING_HIPCC_OPT_LEVEL', '3')}",
             "-DHUMMING_HIP=1",
             *debug_flags,
             *[f"-I{d}" for d in cls.include_dirs()],

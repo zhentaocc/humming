@@ -46,7 +46,9 @@ def get_heuristics_class(device: int | torch.device | None = None) -> type[Devic
     info = DeviceInfo(device)
     if info.is_rocm:
         if info.arch != "gfx950":
-            raise NotImplementedError(f"Humming's ROCm GEMM (MFMA) is tuned and tested on gfx950 only, got {info.arch}")
+            raise NotImplementedError(
+                f"Humming's ROCm GEMM (MFMA) is tuned and tested on gfx950 only, got {info.arch}"
+            )
         return Gfx950Heuristics
     sm_version = info.sm_version
     if info.is_ppu:

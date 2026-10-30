@@ -36,7 +36,9 @@ def make_quantized_linear(
     seed: int = 0,
 ) -> QuantizedLinear:
     generator = torch.Generator(device=device).manual_seed(seed)
-    codes = torch.randint(0, 1 << num_bits, (shape_n, shape_k), dtype=torch.int32, device=device, generator=generator)
+    codes = torch.randint(
+        0, 1 << num_bits, (shape_n, shape_k), dtype=torch.int32, device=device, generator=generator
+    )
     num_groups = shape_k // group_size if group_size else 1
     # Scales like max-abs quantization of N(0, 1) weights: |w| <~ 4 -> 4 / 2^(bits-1).
     base_scale = 4.0 / (1 << (num_bits - 1))

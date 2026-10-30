@@ -60,8 +60,14 @@ def moe_align_block_size(
             expert_map = expert_map.to(torch.int32).contiguous()
         kernel = MoeAlignKernel(int64_ids=topk_ids.dtype == torch.int64)
         kernel(
-            topk_ids, expert_map, sorted_ids, expert_ids, num_tokens_padded,
-            num_experts, block_size, ignore_invalid_experts,
+            topk_ids,
+            expert_map,
+            sorted_ids,
+            expert_ids,
+            num_tokens_padded,
+            num_experts,
+            block_size,
+            ignore_invalid_experts,
         )
         return sorted_ids, expert_ids, num_tokens_padded
     return moe_align_block_size_torch(topk_ids, block_size, num_experts, expert_map, ignore_invalid_experts)

@@ -1,8 +1,8 @@
 """Tile / split-K heuristics for the ROCm gfx950 MFMA weight-only GEMM.
 
 Tuned standalone on MI355X (256 CUs); see docs/rocm/log_mfma.md. The tile only depends on the
-M bucket and the layer shape (N, K, dtype, bits), so one layer compiles at most six kernels. The split-K factor
-depends on the runtime M and is computed by the launcher (csrc/launcher/mfma.h::mfma_num_splits);
+M bucket and the layer shape (N, K, dtype, bits), so one layer compiles at most six kernels. The split-K
+factor depends on the runtime M and is computed by the launcher (csrc/launcher/mfma.h::mfma_num_splits);
 ``get_num_splits`` is the Python mirror used by tests.
 """
 
@@ -45,7 +45,9 @@ class MfmaTile:
 
     @classmethod
     def from_tuning_config(cls, config: dict) -> "MfmaTile":
-        return cls(**{field.name: config[field.name] for field in dataclasses.fields(cls) if field.name in config})
+        return cls(
+            **{field.name: config[field.name] for field in dataclasses.fields(cls) if field.name in config}
+        )
 
 
 # The wide (8 x 4 MFMA tiles per wave, 128 x 256 block) tile halves the LDS A reads per MFMA
@@ -96,7 +98,9 @@ def is_k_starved(tile: MfmaTile, shape_m: int, shape_n: int, shape_k: int, num_c
     return shape_k // CHUNK_K // num_splits < MIN_CHUNKS_PER_SPLIT
 
 
-def select_tile(shape_m: int, shape_n: int, shape_k: int, num_cus: int, is_bfloat16: bool, num_bits: int) -> MfmaTile:
+def select_tile(
+    shape_m: int, shape_n: int, shape_k: int, num_cus: int, is_bfloat16: bool, num_bits: int
+) -> MfmaTile:
     if shape_m <= 8:
         # Decode: no LDS, one 16-row MFMA tile; wider N per wave only when N gives enough blocks.
         tiles_n = 2 if shape_n // 128 >= num_cus // 2 else 1
@@ -160,15 +164,21 @@ def moe_m_intervals(num_experts: int) -> list[tuple[int, int]]:
     num_experts = max(num_experts, 1)
     thresholds = {MOE_DIRECT_A_MAX_ROWS} | {rows * num_experts for rows in MOE_ROWS_PER_EXPERT_BUCKETS}
     bounds = [0] + sorted(thresholds) + [1 << 30]
-    return list(zip(bounds[:-1], bounds[1:]))
+    return list(zip(bounds[:-1], bounds[1:], strict=True))
 
 
-def get_num_splits(tile: MfmaTile, shape_m: int, shape_n: int, shape_k: int, num_cus: int, max_splits: int = MAX_SPLITS) -> int:
+def get_num_splits(
+    tile: MfmaTile, shape_m: int, shape_n: int, shape_k: int, num_cus: int, max_splits: int = MAX_SPLITS
+) -> int:
     """Split K until about one block per CU (each split keeps >= 4 chunks of 128)."""
     num_blocks = math.ceil(shape_n / tile.block_n) * math.ceil(shape_m / tile.block_m)
     num_chunks_k = shape_k // CHUNK_K
     num_splits = 1
-    while num_blocks * num_splits < num_cus and num_splits < max_splits and num_chunks_k // (num_splits * 2) >= 4:
+    while (
+        num_blocks * num_splits < num_cus
+        and num_splits < max_splits
+        and num_chunks_k // (num_splits * 2) >= 4
+    ):
         num_splits *= 2
     return num_splits
 
@@ -216,5 +226,7 @@ class Gfx950Heuristics(DeviceHeuristics):
             from humming.kernel.humming_mfma_f8 import F8_M_INTERVALS as intervals
         else:
             is_bfloat16 = layer_config.a_dtype == dtypes.bfloat16
-            intervals = get_m_intervals(layer_config.shape_n, cls.num_cus(), is_bfloat16, layer_config.b_dtype.num_bits)
+            intervals = get_m_intervals(
+                layer_config.shape_n, cls.num_cus(), is_bfloat16, layer_config.b_dtype.num_bits
+            )
         return [[low, high, cls.get_config(layer_config, high, gemm_type)] for low, high in intervals]

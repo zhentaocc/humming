@@ -12,8 +12,8 @@ import pytest
 import torch
 
 from humming import dtypes
-from humming.kernel import humming_mfma_f8 as f8
 from humming.config import LayerConfig
+from humming.kernel import humming_mfma_f8 as f8
 from humming.rocm import layout_f8
 from tests.rocm.hip_build import build
 
@@ -22,7 +22,8 @@ SOURCE = r"""
 
 // a / b: 64 lanes x 8 words; sa / sb: 64 scale words; c: 16 x 16 row-major.
 template <uint32_t kFmtA, uint32_t kFmtB>
-__global__ void scaled_kernel(const uint32_t *a, const uint32_t *b, const uint32_t *sa, const uint32_t *sb, float *c) {
+__global__ void scaled_kernel(
+    const uint32_t *a, const uint32_t *b, const uint32_t *sa, const uint32_t *sb, float *c) {
   const uint32_t lane = threadIdx.x;
   uint32_t regs_a[8], regs_b[8];
   for (uint32_t i = 0; i < 8; i++) {
@@ -68,11 +69,13 @@ __global__ void lut_kernel(const uint32_t *x, const uint32_t *table, uint32_t *o
   if (i < n) out[i] = mfma_lut_lookup<kBits>(x[i], t);
 }
 
-#define SCALED(NAME, FA, FB)                                                                       \
-  extern "C" int NAME(const void *a, const void *b, const void *sa, const void *sb, void *c, void *s) { \
-    hipLaunchKernelGGL((scaled_kernel<FA, FB>), dim3(1), dim3(64), 0, (hipStream_t)s, (const uint32_t *)a,    \
-                       (const uint32_t *)b, (const uint32_t *)sa, (const uint32_t *)sb, (float *)c);      \
-    return (int)hipGetLastError();                                                                 \
+#define SCALED(NAME, FA, FB)                                                                 \
+  extern "C" int NAME(const void *a, const void *b, const void *sa, const void *sb, void *c,  \
+                      void *s) {                                                               \
+    hipLaunchKernelGGL((scaled_kernel<FA, FB>), dim3(1), dim3(64), 0, (hipStream_t)s,         \
+                       (const uint32_t *)a, (const uint32_t *)b, (const uint32_t *)sa,        \
+                       (const uint32_t *)sb, (float *)c);                                      \
+    return (int)hipGetLastError();                                                             \
   }
 SCALED(scaled_0_0, 0, 0)
 SCALED(scaled_1_0, 1, 0)
@@ -86,15 +89,18 @@ SCALED(scaled_4_2, 4, 2)
 SCALED(scaled_2_3, 2, 3)
 
 extern "C" int int8_x64(const void *a, const void *b, void *c, void *s) {
-  hipLaunchKernelGGL((int8_kernel<4>), dim3(1), dim3(64), 0, (hipStream_t)s, (const uint32_t *)a, (const uint32_t *)b, (int32_t *)c);
+  hipLaunchKernelGGL((int8_kernel<4>), dim3(1), dim3(64), 0, (hipStream_t)s,
+                     (const uint32_t *)a, (const uint32_t *)b, (int32_t *)c);
   return (int)hipGetLastError();
 }
 extern "C" int int8_x32(const void *a, const void *b, void *c, void *s) {
-  hipLaunchKernelGGL((int8_kernel<2>), dim3(1), dim3(64), 0, (hipStream_t)s, (const uint32_t *)a, (const uint32_t *)b, (int32_t *)c);
+  hipLaunchKernelGGL((int8_kernel<2>), dim3(1), dim3(64), 0, (hipStream_t)s,
+                     (const uint32_t *)a, (const uint32_t *)b, (int32_t *)c);
   return (int)hipGetLastError();
 }
 extern "C" int fp8_x32(const void *a, const void *b, void *c, void *s) {
-  hipLaunchKernelGGL(fp8_x32_kernel, dim3(1), dim3(64), 0, (hipStream_t)s, (const uint32_t *)a, (const uint32_t *)b, (float *)c);
+  hipLaunchKernelGGL(fp8_x32_kernel, dim3(1), dim3(64), 0, (hipStream_t)s,
+                     (const uint32_t *)a, (const uint32_t *)b, (float *)c);
   return (int)hipGetLastError();
 }
 #define LUT(BITS)                                                                                  \
@@ -147,7 +153,9 @@ def assert_accumulation_close(c: torch.Tensor, a: torch.Tensor, b: torch.Tensor)
     reference = a @ b.T
     magnitude = a.abs() @ b.abs().T + 1e-30
     error = (c.cpu().double() - reference).abs()
-    assert (error <= ACCUMULATION_RTOL * magnitude).all(), f"max error / sum|ab| {(error / magnitude).max().item():.3g}"
+    assert (error <= ACCUMULATION_RTOL * magnitude).all(), (
+        f"max error / sum|ab| {(error / magnitude).max().item():.3g}"
+    )
 
 
 def random_codes(fmt: int, shape, generator) -> torch.Tensor:
@@ -156,7 +164,9 @@ def random_codes(fmt: int, shape, generator) -> torch.Tensor:
     if bits == 8:  # avoid the e4m3 NaN codes and the e5m2 inf / NaN codes
         max_exponent = (1 << exponent_bits) - 1
         exponent = (codes >> mantissa_bits) & max_exponent
-        codes = torch.where(exponent == max_exponent, codes & ~(1 << (mantissa_bits + exponent_bits - 1)), codes)
+        codes = torch.where(
+            exponent == max_exponent, codes & ~(1 << (mantissa_bits + exponent_bits - 1)), codes
+        )
     return codes
 
 
@@ -277,7 +287,9 @@ def test_lane_k_index_is_a_permutation():
             assert sorted(ks.flatten().tolist()) == list(range(128))
 
 
-@pytest.mark.parametrize(("bits", "has_zero_point"), [(b, z) for b in range(1, 6) for z in (False, True) if b + z <= 5])
+@pytest.mark.parametrize(
+    ("bits", "has_zero_point"), [(b, z) for b in range(1, 6) for z in (False, True) if b + z <= 5]
+)
 def test_int_table_exact_in_e4m3(bits: int, has_zero_point: bool):
     values = layout_f8.int_table_values(bits, has_zero_point)
     encoded = layout_f8.table_bytes(values, "fp8")
@@ -288,7 +300,9 @@ def test_int_table_exact_in_e4m3(bits: int, has_zero_point: bool):
 
 def test_e8m0_and_planes_helpers():
     scales = torch.tensor([[120, 127], [130, 0]], dtype=torch.uint8).view(torch.float8_e8m0fnu)
-    assert torch.equal(layout_f8.group_scale_e8m0(scales), torch.tensor([[120, 130], [127, 0]], dtype=torch.uint8))
+    assert torch.equal(
+        layout_f8.group_scale_e8m0(scales), torch.tensor([[120, 130], [127, 0]], dtype=torch.uint8)
+    )
     assert layout_f8.plane_widths(5) == [4, 1] and layout_f8.plane_widths(7) == [4, 2, 1]
     assert layout_f8.plane_widths(8) == [8]
 
@@ -310,5 +324,7 @@ def test_plan_selection():
         _config(dtypes.float8e4m3, dtypes.float4e2m1, bs_dtype=dtypes.float8e8m0, weight_scale_group_size=32)
     )
     assert plan.b_mode == f8.B_NATIVE and plan.layout == "TRUE" and plan.ws_mode == f8.SCALE_HW
-    plan = f8.plan_mfma_f8(_config(dtypes.int8, dtypes.int4, bs_dtype=dtypes.bfloat16, weight_scale_group_size=128))
+    plan = f8.plan_mfma_f8(
+        _config(dtypes.int8, dtypes.int4, bs_dtype=dtypes.bfloat16, weight_scale_group_size=128)
+    )
     assert plan.b_mode == f8.B_INT_ARITH and plan.mfma_k == 64

@@ -141,7 +141,9 @@ def repack_codes_for_mfma(codes: torch.Tensor, num_bits: int) -> torch.Tensor:
     ndim = len(lead)
     # -> [..., N/16, K/128, lane // 16, lane % 16, t, s] = [..., N/16, K/128, 64 lanes, 32 values]
     order = (*range(ndim), ndim, ndim + 2, ndim + 4, ndim + 1, ndim + 3, ndim + 5)
-    lane_values = codes.permute(*order).reshape(*lead, shape_n // 16, shape_k // 128, WAVE_SIZE, VALUES_PER_LANE)
+    lane_values = codes.permute(*order).reshape(
+        *lead, shape_n // 16, shape_k // 128, WAVE_SIZE, VALUES_PER_LANE
+    )
 
     padded_bits = next_power_of_2(num_bits)
     padded_words = []

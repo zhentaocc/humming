@@ -92,7 +92,9 @@ def _load_kernel(key: MfmaKernelKey):
 _WORKSPACES: dict[torch.device, tuple[torch.Tensor, torch.Tensor]] = {}
 
 
-def _get_workspace(device: torch.device, num_floats: int, num_counters: int) -> tuple[torch.Tensor, torch.Tensor]:
+def _get_workspace(
+    device: torch.device, num_floats: int, num_counters: int
+) -> tuple[torch.Tensor, torch.Tensor]:
     workspace, counters = _WORKSPACES.get(device, (None, None))
     if workspace is None or workspace.numel() < num_floats:
         workspace = torch.empty(max(num_floats, 1 << 20), dtype=torch.float32, device=device)
@@ -122,7 +124,9 @@ def select_tile(
         # K-starved 64x128 grid (< 8 chunks of 128 per split): the 32x128 tile is faster.
         if shape_k // 128 // _num_splits(tile, 64, shape_n, shape_k, num_cus) < 8:
             tile = MfmaTile(warps_m=1, warps_n=4, tiles_m=2, tiles_n=2, stages=3, lds_a=True, scale_b=True)
-    elif gfx950.wide_tile_allowed(is_bfloat16, num_bits) and shape_m > gfx950.wide_tile_min_m(shape_n, num_cus):
+    elif gfx950.wide_tile_allowed(is_bfloat16, num_bits) and shape_m > gfx950.wide_tile_min_m(
+        shape_n, num_cus
+    ):
         tile = MfmaTile(warps_m=1, warps_n=4, tiles_m=8, tiles_n=4, stages=2, lds_a=True, scale_b=True)
     else:
         tile = MfmaTile(warps_m=1, warps_n=4, tiles_m=8, tiles_n=2, stages=2, lds_a=True, scale_b=True)
@@ -176,7 +180,9 @@ def mfma_gemm(
 
     num_tiles = math.ceil(shape_n / tile.block_n) * math.ceil(shape_m / tile.block_m)
     # Split-K partials: [split][output tile][block_m * block_n] in accumulator fragment order.
-    workspace, counters = _get_workspace(inputs.device, num_splits * num_tiles * tile.block_m * tile.block_n, num_tiles)
+    workspace, counters = _get_workspace(
+        inputs.device, num_splits * num_tiles * tile.block_m * tile.block_n, num_tiles
+    )
     key = MfmaKernelKey(inputs.dtype, num_bits, group_size, zero_point is not None, tile)
     launch = _load_kernel(key)
     status = launch(

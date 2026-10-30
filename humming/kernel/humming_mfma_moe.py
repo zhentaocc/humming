@@ -52,7 +52,9 @@ class HummingMfmaMoeKernel(HummingMfmaKernel):
         assert a_dtype in (dtypes.float16, dtypes.bfloat16)
         assert 1 <= self.num_bits <= 8 and self.group_size % 32 == 0
         moe_type = MOE_TYPE_IDS[GemmType(self.gemm_type)]
-        tile = MfmaTile(self.warps_m, self.warps_n, self.tiles_m, self.tiles_n, self.stages, self.lds_a, self.scale_b)
+        tile = MfmaTile(
+            self.warps_m, self.warps_n, self.tiles_m, self.tiles_n, self.stages, self.lds_a, self.scale_b
+        )
         self.code = CODE_TEMPLATE.render(
             tile=tile,
             a_dtype_id=a_dtype.id(),

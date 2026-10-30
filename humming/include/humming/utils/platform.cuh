@@ -4,21 +4,22 @@
 // CUDA: includes <cuda.h> and nothing else, so NVIDIA builds are unchanged.
 // ROCm: maps the CUDA headers/types/intrinsics used by the portable kernels onto HIP.
 //
-// Contract for device code (both platforms):
+// Contract for device code:
 //   HUMMING_HIP            defined (to 1) when compiling for AMD GPUs.
-//   kWarpSize              hardware warp/wavefront width (32 on NVIDIA, 64 on CDNA).
-//   kLogicalWarpSize       32. Portable kernels are written for 32-lane warps; on ROCm a
-//                          64-lane wavefront holds two logical warps (lanes 0-31, 32-63).
-//   kFullWarpMask          all-lanes mask of the hardware warp (uint32_t / uint64_t).
-//   __shfl_*_sync, __reduce_{add,max,min}_sync, __ballot_sync, __syncwarp
-//                          On ROCm these act on the 32-lane logical warp (default width 32);
-//                          the mask is accepted in any integer width and ignored: callers
-//                          must pass the full logical warp (all 32 lanes active and converged).
 //   HUMMING_NAMED_BARRIER_SYNC(id, threads)
 //                          bar.sync on CUDA. ROCm has no named barriers: falls back to
 //                          __syncthreads(), which is only correct when every thread of the block
 //                          executes the same sequence of named-barrier syncs.
-//   HUMMING_DEVICE_ASSERT_FAIL(message)   ROCm only: device-side trap.
+// ROCm only (the CUDA side defines nothing else, so NVIDIA PTX is unchanged):
+//   kWarpSize              hardware wavefront width (64 on CDNA).
+//   kLogicalWarpSize       32. Portable kernels are written for 32-lane warps; on ROCm a
+//                          64-lane wavefront holds two logical warps (lanes 0-31, 32-63).
+//   kFullWarpMask          all-lanes mask of the hardware wavefront (uint64_t).
+//   __shfl_*_sync, __reduce_{add,max,min}_sync, __ballot_sync, __syncwarp
+//                          On ROCm these act on the 32-lane logical warp (default width 32);
+//                          the mask is accepted in any integer width and ignored: callers
+//                          must pass the full logical warp (all 32 lanes active and converged).
+//   HUMMING_DEVICE_ASSERT_FAIL(message)   device-side trap.
 
 #include <cstdint>
 
@@ -29,10 +30,6 @@
 #ifndef HUMMING_HIP
 
 #include <cuda.h>
-
-constexpr uint32_t kWarpSize = 32;
-constexpr uint32_t kLogicalWarpSize = 32;
-constexpr uint32_t kFullWarpMask = 0xFFFFFFFFu;
 
 #define HUMMING_NAMED_BARRIER_SYNC(barrier_id, num_threads) \
   asm volatile("bar.sync %0, %1;" : : "r"(barrier_id), "r"(num_threads) : "memory")

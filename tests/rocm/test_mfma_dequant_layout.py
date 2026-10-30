@@ -12,7 +12,8 @@ SOURCE_TEMPLATE = r"""
 #include <humming/kernel/humming_mfma.cuh>
 
 // One 16 x 128 chunk: lane l writes its 32 dequantized values (MFMA t, slot s) to out[l][t * 8 + s].
-__global__ void dequant_chunk_kernel(const uint32_t *qb_ptr, const uint8_t *zp_ptr, const uint16_t *scale_ptr, uint16_t *out_ptr) {{
+__global__ void dequant_chunk_kernel(
+    const uint32_t *qb_ptr, const uint8_t *zp_ptr, const uint16_t *scale_ptr, uint16_t *out_ptr) {{
   using Dequant = MfmaDequant<UInt{bits}, {element_a}, {has_zero_point}>;
   const uint32_t lane = threadIdx.x;
   uint32_t qb[{bits}];
@@ -60,7 +61,11 @@ def test_dequant_fragment_layout(dtype: torch.dtype, num_bits: int, has_zero_poi
         zero_point = torch.full((16,), 1 << (num_bits - 1), dtype=torch.int32, device="cuda")
     words = layout.repack_codes_for_mfma(codes, num_bits)
     # Scales spanning several binades, including ones whose products round.
-    scale = (torch.rand(16, device="cuda") * 3 + 0.01).to(dtype) if scaled else torch.ones(16, dtype=dtype, device="cuda")
+    scale = (
+        (torch.rand(16, device="cuda") * 3 + 0.01).to(dtype)
+        if scaled
+        else torch.ones(16, dtype=dtype, device="cuda")
+    )
     outputs = torch.empty(64, 32, dtype=dtype, device="cuda")
     stream = torch.cuda.current_stream().cuda_stream
     status = library.launch(

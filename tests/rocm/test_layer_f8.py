@@ -83,10 +83,26 @@ CASE_BY_ID = {case_id: (weight, inputs) for case_id, weight, inputs in CASES}
 
 # One case per kernel family; M values hit every tile bucket of select_f8_tile (64-row tiles with
 # three stages, 128-row tiles, 2 x 2-wave FP4 tiles) with partial M and N tiles (N = 2112).
-TILE_BUCKET_CASES = ["e4m3-channel", "int4-g128", "int4-g256", "uint3-zp-g64", "mxfp4", "a-mxfp4-mxfp4", "a-int8-int8", "a-int8-int4-g128"]
+TILE_BUCKET_CASES = [
+    "e4m3-channel",
+    "int4-g128",
+    "int4-g256",
+    "uint3-zp-g64",
+    "mxfp4",
+    "a-mxfp4-mxfp4",
+    "a-int8-int8",
+    "a-int8-int4-g128",
+]
 TILE_BUCKET_M = [100, 300, 2049, 3000]
 
-REAL_SHAPE_CASES = ["e4m3-channel", "e4m3-block128-ag128", "int4-g64", "mxfp4", "a-mxfp4-mxfp4", "a-int8-int8"]
+REAL_SHAPE_CASES = [
+    "e4m3-channel",
+    "e4m3-block128-ag128",
+    "int4-g64",
+    "mxfp4",
+    "a-mxfp4-mxfp4",
+    "a-int8-int8",
+]
 
 # Configs that must raise NotImplementedError on ROCm (never run with wrong results).
 UNSUPPORTED_CASES = [
@@ -117,7 +133,9 @@ def dequant_activation(quantized: torch.Tensor, scale: torch.Tensor, shape_k: in
 
 
 @functools.cache
-def build_layer(case_id: str, shape_n: int, shape_k: int, torch_dtype: torch.dtype = torch.bfloat16, bias: bool = False):
+def build_layer(
+    case_id: str, shape_n: int, shape_k: int, torch_dtype: torch.dtype = torch.bfloat16, bias: bool = False
+):
     weight_config, input_config = CASE_BY_ID[case_id]
     torch.manual_seed(2026)
     layer = HummingLayer(
@@ -175,7 +193,10 @@ def test_layer_f8_tile_buckets(case_id: str, shape_m: int):
 @pytest.mark.parametrize("case_id", REAL_SHAPE_CASES)
 def test_layer_f8_real_shapes(case_id: str, shape_n: int, shape_k: int, shape_m: int):
     weight_config, input_config = CASE_BY_ID[case_id]
-    for group, size in ((weight_config.get("group_size", 0), shape_k), (weight_config.get("group_size_n", 0), shape_n)):
+    for group, size in (
+        (weight_config.get("group_size", 0), shape_k),
+        (weight_config.get("group_size_n", 0), shape_n),
+    ):
         if group and size % group:
             pytest.skip(f"the weight quantizer needs {size} to be a multiple of the group size {group}")
     if shape_k % 128 and input_config.get("group_size"):
@@ -185,7 +206,9 @@ def test_layer_f8_real_shapes(case_id: str, shape_n: int, shape_k: int, shape_m:
     check(case_id, shape_m, shape_n, shape_k)
 
 
-@pytest.mark.parametrize("case_id", ["e4m3-channel", "int4-g128", "mxfp4", "a-int8-int4-g128", "a-mxfp4-mxfp4"])
+@pytest.mark.parametrize(
+    "case_id", ["e4m3-channel", "int4-g128", "mxfp4", "a-int8-int4-g128", "a-mxfp4-mxfp4"]
+)
 def test_layer_f8_float16_output(case_id: str):
     check(case_id, 64, SHAPE_N, SHAPE_K, torch.float16)
 
@@ -195,7 +218,9 @@ def test_layer_f8_bias(case_id: str):
     check(case_id, 7, SHAPE_N, SHAPE_K, bias=True)
 
 
-@pytest.mark.parametrize("weight_config", [{"dtype": "int4", "group_size": 128}, {"dtype": "float8e4m3"}], ids=str)
+@pytest.mark.parametrize(
+    "weight_config", [{"dtype": "int4", "group_size": 128}, {"dtype": "float8e4m3"}], ids=str
+)
 def test_layer_f8_static_tensor_scale(weight_config):
     layer = HummingLayer(
         shape_n=SHAPE_N,
@@ -233,7 +258,9 @@ def test_layer_f8_graph_capture(case_id: str, shape_m: int):
         assert error < 5e-3, f"graph replay relative error {error:.3g}"
 
 
-@pytest.mark.parametrize(("case_id", "weight_config", "input_config"), UNSUPPORTED_CASES, ids=[c[0] for c in UNSUPPORTED_CASES])
+@pytest.mark.parametrize(
+    ("case_id", "weight_config", "input_config"), UNSUPPORTED_CASES, ids=[c[0] for c in UNSUPPORTED_CASES]
+)
 def test_layer_f8_unsupported_raises(case_id, weight_config, input_config):
     layer = HummingLayer(
         shape_n=SHAPE_N,

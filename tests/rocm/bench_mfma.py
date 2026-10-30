@@ -66,20 +66,29 @@ def bench_shape(shape_m, shape_n, shape_k, args, linear, dtype, tile=None, num_s
 
     def run(i):
         mfma_gemm(
-            inputs, weights[i], linear.mfma_scale, linear.mfma_zero_point, args.bits, args.group,
-            tile=tile, num_splits=num_splits, outputs=outputs,
+            inputs,
+            weights[i],
+            linear.mfma_scale,
+            linear.mfma_zero_point,
+            args.bits,
+            args.group,
+            tile=tile,
+            num_splits=num_splits,
+            outputs=outputs,
         )
 
     us = time_rotating(run, copies, args.warmup, args.iters)
-    del weights
+    weights.clear()
 
     fp16_bytes = shape_n * shape_k * 2
     fp16_copies = num_copies(fp16_bytes)
     dense = linear.dequantized().to(dtype)
     dense_weights = [dense.clone() for _ in range(fp16_copies)]
     del dense
-    us_ref = time_rotating(lambda i: torch.matmul(inputs, dense_weights[i].T, out=outputs), fp16_copies, args.warmup, args.iters)
-    del dense_weights
+    us_ref = time_rotating(
+        lambda i: torch.matmul(inputs, dense_weights[i].T, out=outputs), fp16_copies, args.warmup, args.iters
+    )
+    dense_weights.clear()
 
     io_bytes = shape_m * shape_k * 2 + shape_m * shape_n * 2
     flops = 2.0 * shape_m * shape_n * shape_k
@@ -103,7 +112,9 @@ def main():
     parser.add_argument("--shapes", default=",".join(f"{n}x{k}" for n, k in DEFAULT_SHAPES))
     parser.add_argument("--check", action="store_true", help="also check correctness vs FP32 torch")
     parser.add_argument("--check-only", action="store_true", help="correctness only, no timing")
-    parser.add_argument("--tile", default=None, help="warps_m,warps_n,tiles_m,tiles_n,stages[,lds_a[,scale_b]]")
+    parser.add_argument(
+        "--tile", default=None, help="warps_m,warps_n,tiles_m,tiles_n,stages[,lds_a[,scale_b]]"
+    )
     parser.add_argument("--splits", type=int, default=None)
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iters", type=int, default=100)
@@ -130,21 +141,30 @@ def main():
     for shape_n, shape_k in shapes:
         linear = make_quantized_linear(shape_n, shape_k, args.bits, args.group, args.zp, dtype)
         for shape_m in ms:
-            selected_tile, selected_splits = select_tile(shape_m, shape_n, shape_k, args.bits, is_bfloat16=dtype == torch.bfloat16)
+            selected_tile, selected_splits = select_tile(
+                shape_m, shape_n, shape_k, args.bits, is_bfloat16=dtype == torch.bfloat16
+            )
             used_tile = tile or selected_tile
             used_splits = args.splits or selected_splits
             t = used_tile
-            row = f"| {shape_m} | {shape_n} | {shape_k} | {t.warps_m},{t.warps_n},{t.tiles_m},{t.tiles_n},{t.stages}{',lds' if t.lds_a else ''}{',sb' if t.scale_b else ''} x{used_splits} |"
+            tile_str = f"{t.warps_m},{t.warps_n},{t.tiles_m},{t.tiles_n},{t.stages}"
+            tile_str += (",lds" if t.lds_a else "") + (",sb" if t.scale_b else "")
+            row = f"| {shape_m} | {shape_n} | {shape_k} | {tile_str} x{used_splits} |"
             if not args.check_only:
                 r = bench_shape(shape_m, shape_n, shape_k, args, linear, dtype, tile, args.splits)
-                row += (
-                    f" {r['us']:.1f} | {r['tbs']:.2f} | {r['tflops']:.1f} | {r['us_ref']:.1f} | {r['tbs_ref']:.2f} | {r['speedup']:.2f}x |"
-                )
+                row += f" {r['us']:.1f} | {r['tbs']:.2f} | {r['tflops']:.1f} |"
+                row += f" {r['us_ref']:.1f} | {r['tbs_ref']:.2f} | {r['speedup']:.2f}x |"
             if args.check:
                 inputs = torch.randn(shape_m, shape_k, dtype=dtype, device="cuda")
                 outputs = mfma_gemm(
-                    inputs, linear.mfma_weight, linear.mfma_scale, linear.mfma_zero_point, args.bits, args.group,
-                    tile=tile, num_splits=args.splits,
+                    inputs,
+                    linear.mfma_weight,
+                    linear.mfma_scale,
+                    linear.mfma_zero_point,
+                    args.bits,
+                    args.group,
+                    tile=tile,
+                    num_splits=args.splits,
                 )
                 reference = inputs.float() @ linear.dequantized().T
                 max_abs, max_rel = error_stats(outputs, reference)

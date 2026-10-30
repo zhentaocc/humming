@@ -49,7 +49,10 @@ def relative_error(layer, reference_weight, bias, shape_m, dtype):
 
 def weight_config(num_bits, group_size, has_zero_point):
     # "intN" is symmetric (implicit zero point 2^(N-1)); "uintN" + has_zero_point is asymmetric.
-    config = {"dtype": f"uint{num_bits}" if has_zero_point else f"int{num_bits}", "has_zero_point": has_zero_point}
+    config = {
+        "dtype": f"uint{num_bits}" if has_zero_point else f"int{num_bits}",
+        "has_zero_point": has_zero_point,
+    }
     if group_size:
         config["group_size"] = group_size
     return config
@@ -62,7 +65,9 @@ SCALE_CASES = [(0, False), (32, True), (64, False), (128, False), (128, True)]
 @pytest.mark.parametrize("num_bits", [1, 2, 3, 4, 5, 6, 7, 8])
 @pytest.mark.parametrize(("group_size", "has_zero_point"), SCALE_CASES, ids=lambda v: str(v))
 def test_bits_and_scales(dtype, num_bits, group_size, has_zero_point):
-    layer, reference_weight, bias = build_layer(512, 1024, weight_config(num_bits, group_size, has_zero_point), dtype)
+    layer, reference_weight, bias = build_layer(
+        512, 1024, weight_config(num_bits, group_size, has_zero_point), dtype
+    )
     for shape_m in M_VALUES:
         assert relative_error(layer, reference_weight, bias, shape_m, dtype) < TOLERANCE[dtype], shape_m
 
@@ -84,10 +89,14 @@ def test_real_shapes(dtype, shape_n, shape_k, config):
 
 
 @pytest.mark.parametrize("dtype", DTYPES, ids=DTYPE_IDS)
-@pytest.mark.parametrize(("shape_n", "shape_k"), [(96, 224), (1056, 1056), (4128, 3008)], ids=lambda v: str(v))
+@pytest.mark.parametrize(
+    ("shape_n", "shape_k"), [(96, 224), (1056, 1056), (4128, 3008)], ids=lambda v: str(v)
+)
 def test_padding_and_bias(dtype, shape_n, shape_k):
     """N / K that are not multiples of 64 / 128 are padded by transform(); bias is added after."""
-    layer, reference_weight, bias = build_layer(shape_n, shape_k, weight_config(4, 32, True), dtype, has_bias=True)
+    layer, reference_weight, bias = build_layer(
+        shape_n, shape_k, weight_config(4, 32, True), dtype, has_bias=True
+    )
     for shape_m in M_VALUES:
         assert relative_error(layer, reference_weight, bias, shape_m, dtype) < TOLERANCE[dtype], shape_m
 

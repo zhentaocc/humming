@@ -138,7 +138,9 @@ def _get_device_info_extension() -> ModuleType:
     extension_name = jit_utils.get_native_artifact_name("device_info")
     is_rocm = rocm_utils.is_rocm_build()
     # Precompiled wheels only ship the CUDA driver build.
-    precompiled_path = None if is_rocm else jit_utils.get_precompiled_artifact_path(source_path, extension_name)
+    precompiled_path = (
+        None if is_rocm else jit_utils.get_precompiled_artifact_path(source_path, extension_name)
+    )
     if precompiled_path is not None:
         _extension = _load_device_info_extension(precompiled_path)
         return _extension

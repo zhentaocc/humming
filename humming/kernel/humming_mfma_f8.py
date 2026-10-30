@@ -100,7 +100,9 @@ def _a_format(config: LayerConfig) -> int:
         return FMT_E2M1
     if a_dtype == dtypes.int8:
         return FMT_INT8
-    raise _Unsupported(f"activation dtype {a_dtype} (low-bit activations: float8e4m3, float8e5m2, int8, float4e2m1)")
+    raise _Unsupported(
+        f"activation dtype {a_dtype} (low-bit activations: float8e4m3, float8e5m2, int8, float4e2m1)"
+    )
 
 
 def _activation_scale(config: LayerConfig) -> tuple[str, int]:
@@ -114,7 +116,8 @@ def _activation_scale(config: LayerConfig) -> tuple[str, int]:
         group = config.input_scale_group_size
         if config.pad_shape_k:
             raise _Unsupported(
-                f"per-group activation scales with K={config.shape_k - config.pad_shape_k} not a multiple of {CHUNK_K}"
+                f"per-group activation scales with K={config.shape_k - config.pad_shape_k} "
+                f"not a multiple of {CHUNK_K}"
             )
         if group % 32 or config.shape_k % group:
             raise _Unsupported(f"activation scale group size {group} (must be a multiple of 32 dividing K)")
@@ -172,7 +175,9 @@ def _table(values: torch.Tensor, target: str, what: str) -> tuple[int, ...]:
 
     encoded = layout_f8.table_bytes(values, target)
     if encoded is None:
-        raise _Unsupported(f"{what} (values not exactly representable as {'e4m3' if target == 'fp8' else 'int8'})")
+        raise _Unsupported(
+            f"{what} (values not exactly representable as {'e4m3' if target == 'fp8' else 'int8'})"
+        )
     return layout_f8.table_words(encoded)
 
 
@@ -251,7 +256,12 @@ def _plan(config: LayerConfig) -> MfmaF8Plan:
 
             # Doubled e2m1 values are integers (0, 1, 2, 3, 4, 6, 8, 12); the 0.5 goes to the epilogue.
             values = layout_f8.fp_table_values(b_dtype.exponent_bits, b_dtype.mantissa_bits, bits) * 2
-            lut, lut_bits, b_mode, bs2_factor = _table(values, "int8", f"weight dtype {b_dtype}"), bits, B_LUT, 0.5
+            lut, lut_bits, b_mode, bs2_factor = (
+                _table(values, "int8", f"weight dtype {b_dtype}"),
+                bits,
+                B_LUT,
+                0.5,
+            )
         else:
             raise _Unsupported(f"weight dtype {b_dtype} with int8 activations (int1-8 or float4e2m1)")
     else:
@@ -260,7 +270,8 @@ def _plan(config: LayerConfig) -> MfmaF8Plan:
         b_fmt, b_mode = FMT_E4M3, B_LUT
         if b_is_int:
             lut_bits = bits + 1 if has_zero_point else bits
-            what = f"weight dtype {b_dtype}{' with zero points' if has_zero_point else ''} with FP8/FP4 activations"
+            zero_points = " with zero points" if has_zero_point else ""
+            what = f"weight dtype {b_dtype}{zero_points} with FP8/FP4 activations"
             if lut_bits > 5:
                 raise _Unsupported(f"{what} (int1-5 symmetric, int1-4 with zero points)")
             lut = _table(layout_f8.int_table_values(bits, has_zero_point), "fp8", what)
@@ -275,7 +286,9 @@ def _plan(config: LayerConfig) -> MfmaF8Plan:
             lut = _table(values, "fp8", what)
 
     if is_int8 and config.shape_k > INT8_MAX_K:
-        raise _Unsupported(f"int8 activations with K={config.shape_k} > {INT8_MAX_K} (INT32 accumulator range)")
+        raise _Unsupported(
+            f"int8 activations with K={config.shape_k} > {INT8_MAX_K} (INT32 accumulator range)"
+        )
 
     def scale_mode(kind: str) -> int:
         if kind == "fp32":
@@ -342,7 +355,9 @@ def get_mfma_f8_unsupported_reason(config: LayerConfig) -> str | None:
 # Tensor transform.
 
 
-def transform_mfma_f8_tensors(config: LayerConfig, tensors: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+def transform_mfma_f8_tensors(
+    config: LayerConfig, tensors: dict[str, torch.Tensor]
+) -> dict[str, torch.Tensor]:
     """Padded Humming tensors -> the low-bit activation kernel's tensors.
 
     weight [N, K * bits / 32] int32 (layout_f8.py), weight_scale: FP32 [Gw, N] (flushed group /
@@ -412,7 +427,8 @@ CODE_TEMPLATE = jinja2.Template("""
 #include <humming/kernel/humming_mfma_f8.cuh>
 
 using HummingMfmaF8Tile = MfmaF8TileConfig<
-    {{tile.warps_m}}, {{tile.warps_n}}, {{tile.tiles_m}}, {{tile.tiles_n}}, {{tile.stages}}, {{tile.lds_a | lower}}>;
+    {{tile.warps_m}}, {{tile.warps_n}}, {{tile.tiles_m}}, {{tile.tiles_n}}, {{tile.stages}},
+    {{tile.lds_a | lower}}>;
 
 struct HummingMfmaF8Traits {
   using ElementC = {{element_c}};
@@ -469,7 +485,11 @@ def select_f8_tile(shape_m: int, shape_n: int, num_cus: int, plan: MfmaF8Plan) -
         tiles_n = 2 if shape_n // 128 >= num_cus // 2 else 1
         return MfmaTile(tiles_m=1, tiles_n=tiles_n, stages=4)
     if shape_m <= 32:
-        tile = MfmaTile(tiles_m=2, tiles_n=2, stages=2, lds_a=True) if fp4_a else MfmaTile(tiles_m=2, tiles_n=1, stages=3, lds_a=True)
+        tile = (
+            MfmaTile(tiles_m=2, tiles_n=2, stages=2, lds_a=True)
+            if fp4_a
+            else MfmaTile(tiles_m=2, tiles_n=1, stages=3, lds_a=True)
+        )
     elif shape_m <= 64:
         tile = MfmaTile(tiles_m=4, tiles_n=2 if fp4_a else 1, stages=3, lds_a=True)
     elif fp4_a:
@@ -500,7 +520,15 @@ def select_f8_tile(shape_m: int, shape_n: int, num_cus: int, plan: MfmaF8Plan) -
 
 # M intervals (min exclusive, max inclusive); select_f8_tile is evaluated at each upper bound.
 F8_M_INTERVALS = (
-    (0, 8), (8, 32), (32, 64), (64, 128), (128, 256), (256, 512), (512, 1024), (1024, 2048), (2048, 1 << 30)
+    (0, 8),
+    (8, 32),
+    (32, 64),
+    (64, 128),
+    (128, 256),
+    (256, 512),
+    (512, 1024),
+    (1024, 2048),
+    (2048, 1 << 30),
 )
 
 
@@ -530,7 +558,9 @@ class HummingMfmaF8Kernel(KernelRuntime):
     max_splits: int = MAX_SPLITS
 
     def init_kernel(self) -> None:
-        plan = MfmaF8Plan(**{key: tuple(v) if isinstance(v, list) else v for key, v in json.loads(self.plan).items()})
+        plan = MfmaF8Plan(
+            **{key: tuple(v) if isinstance(v, list) else v for key, v in json.loads(self.plan).items()}
+        )
         tile = MfmaTile(self.warps_m, self.warps_n, self.tiles_m, self.tiles_n, self.stages, self.lds_a)
         c_dtype = dtypes.DataType.from_str(self.c_dtype)
         self.code = CODE_TEMPLATE.render(

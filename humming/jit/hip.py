@@ -100,7 +100,9 @@ def module_get_global(module: int, name: str) -> tuple[int, int]:
     """Return ``(device_pointer, size_in_bytes)`` of a ``__device__``/``__constant__`` symbol."""
     pointer = ctypes.c_void_p()
     size = ctypes.c_size_t()
-    result = _library().hipModuleGetGlobal(ctypes.byref(pointer), ctypes.byref(size), HipModule(module), name.encode())
+    result = _library().hipModuleGetGlobal(
+        ctypes.byref(pointer), ctypes.byref(size), HipModule(module), name.encode()
+    )
     check_hip(result, f"hipModuleGetGlobal({name})")
     return pointer.value or 0, size.value
 

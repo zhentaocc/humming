@@ -84,7 +84,8 @@ def get_mfma_unsupported_reason(layer_config: LayerConfig) -> str | None:
         return "floating-point zero points"
     group_size = get_mfma_group_size(layer_config)
     if group_size % 32 != 0 or (group_size and layer_config.shape_k % group_size != 0):
-        return f"weight scale group size {layer_config.weight_scale_group_size} (must be a multiple of 32 dividing K)"
+        group = layer_config.weight_scale_group_size
+        return f"weight scale group size {group} (must be a multiple of 32 dividing K)"
     if layer_config.shape_n % MFMA_N_ALIGNMENT or layer_config.shape_k % MFMA_K_ALIGNMENT:
         return (
             f"padded shape N={layer_config.shape_n}, K={layer_config.shape_k} "
@@ -141,7 +142,9 @@ class HummingMfmaKernel(KernelRuntime):
         a_dtype = dtypes.DataType.from_str(self.a_dtype)
         assert a_dtype in (dtypes.float16, dtypes.bfloat16)
         assert 1 <= self.num_bits <= 8 and self.group_size % 32 == 0
-        tile = MfmaTile(self.warps_m, self.warps_n, self.tiles_m, self.tiles_n, self.stages, self.lds_a, self.scale_b)
+        tile = MfmaTile(
+            self.warps_m, self.warps_n, self.tiles_m, self.tiles_n, self.stages, self.lds_a, self.scale_b
+        )
         self.code = CODE_TEMPLATE.render(
             tile=tile,
             a_dtype_id=a_dtype.id(),
@@ -152,9 +155,9 @@ class HummingMfmaKernel(KernelRuntime):
         )
         element_a = "Float16" if a_dtype == dtypes.float16 else "BFloat16"
         has_zero_point = "true" if self.has_zero_point else "false"
-        self.kernel_expr = (
-            f"humming_mfma<{element_a}, UInt{self.num_bits}, HummingMfmaTile, {self.group_size}, {has_zero_point}>"
-        )
+        tile_args = f"HummingMfmaTile, {self.group_size}, {has_zero_point}"
+        template_args = f"{element_a}, UInt{self.num_bits}, {tile_args}"
+        self.kernel_expr = f"humming_mfma<{template_args}>"
         self.prepare()
         from humming import ops
 
@@ -170,7 +173,8 @@ def _tuning_entries(tuning_obj) -> list:
         low, high, config = entry
         if config.get("mma_type") != "mfma":
             raise NotImplementedError(
-                "Humming on ROCm only runs MFMA tuning configs (mma_type='mfma', see humming/tune/gfx950.py); "
+                "Humming on ROCm only runs MFMA tuning configs "
+                "(mma_type='mfma', see humming/tune/gfx950.py); "
                 f"got {config}"
             )
         entries.append([low, high, config])
@@ -195,14 +199,18 @@ def resolve_mfma_configs(layer_config, compute_config, tuning_config, device=Non
         gemm_type = check_mfma_gemm_type(layer_config_obj, compute_obj.get("gemm_type"))
         layer_obj["sm_version"] = layer_config_obj.sm_version
         if not tuning_obj:
-            tuning_obj = get_heuristics_config(layer_config_obj, gemm_type=gemm_type.value, device=device_index)
+            tuning_obj = get_heuristics_config(
+                layer_config_obj, gemm_type=gemm_type.value, device=device_index
+            )
     return layer_obj, compute_obj, _tuning_entries(tuning_obj)
 
 
 def prepare_mfma_kernels(layer_config, compute_config, tuning_config, device=None) -> torch.Tensor:
     """Compile/register the kernels of every M interval; returns the launcher's int64 config tensor."""
     device_index = get_device_index(device)
-    layer_obj, compute_obj, entries = resolve_mfma_configs(layer_config, compute_config, tuning_config, device_index)
+    layer_obj, compute_obj, entries = resolve_mfma_configs(
+        layer_config, compute_config, tuning_config, device_index
+    )
     layer_config_obj = LayerConfig(**layer_obj)
     kernel_cls = HummingMfmaKernel
     gemm_type = check_mfma_gemm_type(layer_config_obj, compute_obj.get("gemm_type"))
@@ -246,7 +254,11 @@ def get_mfma_gemm_meta(layer_config: str) -> tuple[int, int, int]:
 @functools.lru_cache(maxsize=1024)
 def _parse_mfma_gemm_meta(layer_config: str) -> tuple[int, int, int]:
     layer_obj = json.loads(layer_config)
-    return int(layer_obj["shape_n"]), int(layer_obj.get("pad_shape_n", 0)), int(layer_obj.get("pad_shape_k", 0))
+    return (
+        int(layer_obj["shape_n"]),
+        int(layer_obj.get("pad_shape_n", 0)),
+        int(layer_obj.get("pad_shape_k", 0)),
+    )
 
 
 @torch.compiler.assume_constant_result

@@ -21,7 +21,10 @@ GEMM_TYPES = ["indexed", "grouped_contiguous", "grouped_masked"]
 
 
 def weight_config(num_bits, group_size, has_zero_point):
-    config = {"dtype": f"uint{num_bits}" if has_zero_point else f"int{num_bits}", "has_zero_point": has_zero_point}
+    config = {
+        "dtype": f"uint{num_bits}" if has_zero_point else f"int{num_bits}",
+        "has_zero_point": has_zero_point,
+    }
     if group_size:
         config["group_size"] = group_size
     return config
@@ -81,7 +84,9 @@ def block_m_for(layer, gemm_type, valid_shape_m):
     raise AssertionError(valid_shape_m)
 
 
-def run_moe(layer, reference_weight, bias, inputs, topk_ids, gemm_type, layout_dtype=torch.int64, expert_map=None):
+def run_moe(
+    layer, reference_weight, bias, inputs, topk_ids, gemm_type, layout_dtype=torch.int64, expert_map=None
+):
     """Returns (outputs, reference) restricted to the rows the GEMM defines."""
     num_tokens, top_k = topk_ids.shape
     compute_config = {"gemm_type": gemm_type}
@@ -92,7 +97,11 @@ def run_moe(layer, reference_weight, bias, inputs, topk_ids, gemm_type, layout_d
         block_m = block_m_for(layer, gemm_type, valid_shape_m)
         num_experts = layer.humming_config.num_experts if expert_map is None else expert_map.numel()
         sorted_ids, expert_ids, num_tokens_padded = ops.moe_align_block_size(
-            topk_ids, block_m, num_experts, expert_map=expert_map, ignore_invalid_experts=expert_map is not None
+            topk_ids,
+            block_m,
+            num_experts,
+            expert_map=expert_map,
+            ignore_invalid_experts=expert_map is not None,
         )
         outputs = layer(
             inputs,
@@ -115,7 +124,9 @@ def run_moe(layer, reference_weight, bias, inputs, topk_ids, gemm_type, layout_d
     counts = flat.bincount(minlength=num_experts)
     if gemm_type == "grouped_contiguous":
         offsets = torch.nn.functional.pad(counts.cumsum(0), (1, 0)).to(layout_dtype)
-        outputs = layer(sorted_inputs, expert_layout=offsets, valid_shape_m=valid_shape_m, compute_config=compute_config)
+        outputs = layer(
+            sorted_inputs, expert_layout=offsets, valid_shape_m=valid_shape_m, compute_config=compute_config
+        )
         assert outputs.shape == (sorted_inputs.size(0), reference_weight.size(1))
         return outputs, reference_rows(sorted_inputs, reference_weight, bias, sorted_experts)
 
@@ -129,7 +140,10 @@ def run_moe(layer, reference_weight, bias, inputs, topk_ids, gemm_type, layout_d
     masked_inputs[row_index] = sorted_inputs
     del starts
     outputs = layer(
-        masked_inputs, expert_layout=counts.to(layout_dtype), valid_shape_m=valid_shape_m, compute_config=compute_config
+        masked_inputs,
+        expert_layout=counts.to(layout_dtype),
+        valid_shape_m=valid_shape_m,
+        compute_config=compute_config,
     )
     assert outputs.shape == (masked_inputs.size(0), reference_weight.size(1))
     return outputs[row_index], reference_rows(sorted_inputs, reference_weight, bias, sorted_experts)
@@ -145,7 +159,9 @@ def relative_error(outputs, reference):
 
 @pytest.mark.parametrize("dtype", DTYPES, ids=DTYPE_IDS)
 @pytest.mark.parametrize("gemm_type", GEMM_TYPES)
-@pytest.mark.parametrize(("num_experts", "top_k"), [(8, 2), (64, 8), (128, 1), (256, 8)], ids=lambda v: str(v))
+@pytest.mark.parametrize(
+    ("num_experts", "top_k"), [(8, 2), (64, 8), (128, 1), (256, 8)], ids=lambda v: str(v)
+)
 def test_layouts(dtype, gemm_type, num_experts, top_k):
     layer, reference_weight, _ = build_moe_layer(num_experts, 256, 512, W4G128, dtype)
     for num_tokens in [1, 4, 16, 64, 512, 4096]:
@@ -284,8 +300,12 @@ def test_all_experts_empty(gemm_type):
     else:
         layout = torch.zeros(9 if gemm_type == "grouped_contiguous" else 8, dtype=torch.int64, device="cuda")
         outputs = torch.full((16, 128), 7.0, dtype=dtype, device="cuda")
-        layer(torch.randn(16, 256, dtype=dtype, device="cuda"), outputs=outputs, expert_layout=layout,
-              compute_config={"gemm_type": gemm_type})
+        layer(
+            torch.randn(16, 256, dtype=dtype, device="cuda"),
+            outputs=outputs,
+            expert_layout=layout,
+            compute_config={"gemm_type": gemm_type},
+        )
     torch.cuda.synchronize()
     assert (outputs == 7.0).all()
 
@@ -302,7 +322,9 @@ def test_expert_parallel_map():
         topk_ids = random_topk_ids(num_tokens, global_experts, 4)
         if (expert_map[topk_ids.long()] < 0).all():
             continue
-        outputs, reference = run_moe(layer, reference_weight, None, inputs, topk_ids, "indexed", expert_map=expert_map)
+        outputs, reference = run_moe(
+            layer, reference_weight, None, inputs, topk_ids, "indexed", expert_map=expert_map
+        )
         assert relative_error(outputs, reference) < TOLERANCE[dtype], num_tokens
 
 
@@ -310,7 +332,9 @@ def test_expert_parallel_map():
 @pytest.mark.parametrize("gemm_type", GEMM_TYPES)
 def test_padding_and_bias(dtype, gemm_type):
     """N / K not multiples of 64 / 128 (padded by transform), per-expert bias added in the kernel."""
-    layer, reference_weight, bias = build_moe_layer(8, 96, 224, weight_config(4, 32, True), dtype, has_bias=True)
+    layer, reference_weight, bias = build_moe_layer(
+        8, 96, 224, weight_config(4, 32, True), dtype, has_bias=True
+    )
     for num_tokens in [1, 33, 700]:
         inputs = torch.randn(num_tokens, 224, dtype=dtype, device="cuda")
         topk_ids = random_topk_ids(num_tokens, 8, 2)
@@ -328,9 +352,19 @@ def test_strided_outputs():
     sorted_ids, expert_ids, num_tokens_padded = ops.moe_align_block_size(topk_ids, 16, 8)
     wide = torch.zeros(40, 300, dtype=dtype, device="cuda")
     outputs = wide[:, 10:266]
-    layer(inputs, outputs=outputs, sorted_ids=sorted_ids, expert_ids=expert_ids, num_tokens_padded=num_tokens_padded,
-          top_k=2, valid_shape_m=40, compute_config={"gemm_type": "indexed"})
-    reference = reference_rows(inputs.repeat_interleave(2, 0), reference_weight, None, topk_ids.flatten().long())
+    layer(
+        inputs,
+        outputs=outputs,
+        sorted_ids=sorted_ids,
+        expert_ids=expert_ids,
+        num_tokens_padded=num_tokens_padded,
+        top_k=2,
+        valid_shape_m=40,
+        compute_config={"gemm_type": "indexed"},
+    )
+    reference = reference_rows(
+        inputs.repeat_interleave(2, 0), reference_weight, None, topk_ids.flatten().long()
+    )
     assert relative_error(outputs, reference) < TOLERANCE[dtype]
     assert (wide[:, :10] == 0).all() and (wide[:, 266:] == 0).all()
 
@@ -355,16 +389,29 @@ def test_cuda_graph_capture(gemm_type, num_tokens):
     def forward():
         if gemm_type == "indexed":
             block_m = block_m_for(layer, gemm_type, rows)
-            sorted_ids, expert_ids, num_tokens_padded = ops.moe_align_block_size(topk_ids, block_m, num_experts)
-            return layer(inputs, sorted_ids=sorted_ids, expert_ids=expert_ids, num_tokens_padded=num_tokens_padded,
-                         top_k=top_k, valid_shape_m=rows, compute_config=compute_config)
+            sorted_ids, expert_ids, num_tokens_padded = ops.moe_align_block_size(
+                topk_ids, block_m, num_experts
+            )
+            return layer(
+                inputs,
+                sorted_ids=sorted_ids,
+                expert_ids=expert_ids,
+                num_tokens_padded=num_tokens_padded,
+                top_k=top_k,
+                valid_shape_m=rows,
+                compute_config=compute_config,
+            )
         flat = topk_ids.flatten().long()
         order = flat.argsort(stable=True)
-        counts = torch.zeros(num_experts, dtype=torch.int64, device="cuda").scatter_add_(0, flat, torch.ones_like(flat))
+        counts = torch.zeros(num_experts, dtype=torch.int64, device="cuda").scatter_add_(
+            0, flat, torch.ones_like(flat)
+        )
         sorted_inputs = inputs[order // top_k]
         if gemm_type == "grouped_contiguous":
             offsets = torch.nn.functional.pad(counts.cumsum(0), (1, 0))
-            return layer(sorted_inputs, expert_layout=offsets, valid_shape_m=rows, compute_config=compute_config)
+            return layer(
+                sorted_inputs, expert_layout=offsets, valid_shape_m=rows, compute_config=compute_config
+            )
         starts = counts.cumsum(0) - counts
         sorted_experts = flat[order]
         dest = sorted_experts * max_tokens + torch.arange(rows, device="cuda") - starts[sorted_experts]
@@ -410,8 +457,11 @@ ALIGN_IDS = ["hip", "torch"]
 @pytest.mark.parametrize("num_tokens", [0, 1, 5, 64, 1000, 8192])
 @pytest.mark.parametrize(("num_experts", "top_k", "block_size"), [(8, 2, 16), (64, 8, 32), (256, 8, 128)])
 def test_moe_align_block_size(align, num_tokens, num_experts, top_k, block_size):
-    topk_ids = random_topk_ids(num_tokens, num_experts, top_k) if num_tokens else torch.empty(
-        0, top_k, dtype=torch.int32, device="cuda")
+    topk_ids = (
+        random_topk_ids(num_tokens, num_experts, top_k)
+        if num_tokens
+        else torch.empty(0, top_k, dtype=torch.int32, device="cuda")
+    )
     sorted_ids, expert_ids, num_tokens_padded = align(topk_ids, block_size, num_experts)
     numel = topk_ids.numel()
     # Same buffer sizes as vLLM's moe_align_block_size.
@@ -427,11 +477,11 @@ def test_moe_align_block_size(align, num_tokens, num_experts, top_k, block_size)
     seen = []
     for block in range(used // block_size):
         expert = int(expert_ids[block])
-        ids = sorted_ids[block * block_size:(block + 1) * block_size]
+        ids = sorted_ids[block * block_size : (block + 1) * block_size]
         real = ids[ids < numel]
         assert (flat[real] == expert).all()
         seen.append(real)
-    assert (expert_ids[used // block_size:] == -1).all()
+    assert (expert_ids[used // block_size :] == -1).all()
     assert (sorted_ids[used:] == numel).all()
     seen = torch.cat(seen) if seen else torch.empty(0, dtype=torch.int32)
     assert sorted(seen.tolist()) == list(range(numel))
@@ -442,7 +492,9 @@ def canonical_alignment(sorted_ids, expert_ids, num_tokens_padded, block_size):
     order of rows inside an expert; padding sorts last since it equals numel)."""
     sorted_ids, expert_ids = sorted_ids.long().cpu(), expert_ids.cpu()
     if expert_ids.numel():
-        run = torch.cat([torch.zeros(1, dtype=torch.long), (expert_ids[1:] != expert_ids[:-1]).long()]).cumsum(0)
+        run = torch.cat(
+            [torch.zeros(1, dtype=torch.long), (expert_ids[1:] != expert_ids[:-1]).long()]
+        ).cumsum(0)
         key = run.repeat_interleave(block_size) * (1 << 32) + sorted_ids
         sorted_ids = sorted_ids[key.argsort()]
     return sorted_ids, expert_ids, int(num_tokens_padded)
@@ -450,8 +502,10 @@ def canonical_alignment(sorted_ids, expert_ids, num_tokens_padded, block_size):
 
 @pytest.mark.parametrize("ids_dtype", [torch.int32, torch.int64])
 @pytest.mark.parametrize("map_mode", ["none", "keep", "ignore"])
-@pytest.mark.parametrize(("num_tokens", "num_experts", "top_k", "block_size"),
-                         [(1, 8, 2, 16), (3, 256, 8, 16), (77, 64, 6, 32), (4096, 128, 8, 64), (513, 1024, 4, 16)])
+@pytest.mark.parametrize(
+    ("num_tokens", "num_experts", "top_k", "block_size"),
+    [(1, 8, 2, 16), (3, 256, 8, 16), (77, 64, 6, 32), (4096, 128, 8, 64), (513, 1024, 4, 16)],
+)
 def test_moe_align_hip_matches_torch(ids_dtype, map_mode, num_tokens, num_experts, top_k, block_size):
     """HIP align == torch align (up to the row order inside an expert): expert_map, int64, invalid ids."""
     topk_ids = random_topk_ids(num_tokens, num_experts, top_k).to(ids_dtype)
@@ -460,7 +514,9 @@ def test_moe_align_hip_matches_torch(ids_dtype, map_mode, num_tokens, num_expert
     if map_mode != "none":
         expert_map = torch.full((num_experts,), -1, dtype=torch.int32, device="cuda")
         local = num_experts // 2
-        expert_map[num_experts // 4:num_experts // 4 + local] = torch.arange(local, dtype=torch.int32, device="cuda")
+        expert_map[num_experts // 4 : num_experts // 4 + local] = torch.arange(
+            local, dtype=torch.int32, device="cuda"
+        )
     ignore = map_mode == "ignore"
     hip = ops.moe_align_block_size(topk_ids, block_size, num_experts, expert_map, ignore)
     ref = ops.moe_align_block_size_torch(topk_ids, block_size, num_experts, expert_map, ignore)

@@ -239,7 +239,13 @@ def init_humming_launcher():
             torch_lib_dir = Path(torch.__file__).parent / "lib"
             extra_include_paths = [str(rocm_utils.get_rocm_include_path())]
             extra_cflags += ["-DHUMMING_HIP=1", "-D__HIP_PLATFORM_AMD__=1"]
-            extra_ldflags = [f"-L{torch_lib_dir}", f"-Wl,-rpath,{torch_lib_dir}", "-lamdhip64", "-lc10_hip", "-ltorch_hip"]
+            extra_ldflags = [
+                f"-L{torch_lib_dir}",
+                f"-Wl,-rpath,{torch_lib_dir}",
+                "-lamdhip64",
+                "-lc10_hip",
+                "-ltorch_hip",
+            ]
         else:
             cuda_env = filter_cuda_paths(
                 required_headers=["cuda.h", "crt/host_defines.h", "cuda/std/cstdint"],

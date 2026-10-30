@@ -55,7 +55,9 @@ def test_single_mfma_layout(dtype: torch.dtype, shape_m: int):
     prefix = "f16" if dtype == torch.float16 else "bf16"
     launch = getattr(library, f"launch_{prefix}_{shape_m}")
     stream = ctypes.c_void_p(torch.cuda.current_stream().cuda_stream)
-    status = launch(ctypes.c_void_p(a.data_ptr()), ctypes.c_void_p(b.data_ptr()), ctypes.c_void_p(c.data_ptr()), stream)
+    status = launch(
+        ctypes.c_void_p(a.data_ptr()), ctypes.c_void_p(b.data_ptr()), ctypes.c_void_p(c.data_ptr()), stream
+    )
     assert status == 0
     torch.cuda.synchronize()
     reference = a.float() @ b.float().T

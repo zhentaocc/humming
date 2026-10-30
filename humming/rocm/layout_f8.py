@@ -123,7 +123,6 @@ def repack_codes(codes: torch.Tensor, num_bits: int, layout: str, packing: str) 
 
 def repack_weight(packed_weight: torch.Tensor, num_bits: int, layout: str, packing: str) -> torch.Tensor:
     """Humming's standard packed weight ``[N, K * bits / 32]`` -> the kernel's B layout."""
-    shape_n = packed_weight.size(0)
     shape_k = packed_weight.size(1) * 32 // num_bits
     # Bound the int64 temporaries of the pure-torch repack to ~2^25 codes per slice.
     rows = max(CHUNK_N, (1 << 25) // shape_k // CHUNK_N * CHUNK_N)
@@ -145,7 +144,9 @@ def unrepack_weight(weight: torch.Tensor, num_bits: int, layout: str, packing: s
         values = _unpack_planes(words, num_bits)
     k_index = lane_k_index(layout, weight.device)
     lane_row = torch.arange(WAVE_SIZE, device=weight.device).view(-1, 1).expand(-1, VALUES_PER_LANE) % 16
-    codes = torch.empty(shape_n // CHUNK_N, shape_k // CHUNK_K, CHUNK_N, CHUNK_K, dtype=torch.int32, device=weight.device)
+    codes = torch.empty(
+        shape_n // CHUNK_N, shape_k // CHUNK_K, CHUNK_N, CHUNK_K, dtype=torch.int32, device=weight.device
+    )
     codes[:, :, lane_row, k_index.expand(WAVE_SIZE, -1)] = values
     return codes.permute(0, 2, 1, 3).reshape(shape_n, shape_k)
 

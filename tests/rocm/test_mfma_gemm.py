@@ -12,7 +12,9 @@ from tests.rocm.mfma_gemm import MfmaTile, mfma_gemm, select_tile
 from tests.rocm.quant_utils import TOLERANCE, error_stats, make_quantized_linear
 
 
-def run_case(shape_m, shape_n, shape_k, num_bits, group_size, has_zero_point, dtype, tile=None, num_splits=None):
+def run_case(
+    shape_m, shape_n, shape_k, num_bits, group_size, has_zero_point, dtype, tile=None, num_splits=None
+):
     linear = make_quantized_linear(shape_n, shape_k, num_bits, group_size, has_zero_point, dtype)
     inputs = torch.randn(shape_m, shape_k, dtype=dtype, device="cuda")
     outputs = mfma_gemm(
@@ -71,7 +73,11 @@ def test_tiles_and_splits(dtype, tile, num_splits):
 @pytest.mark.parametrize("shape_m", [1, 77, 300])
 @pytest.mark.parametrize("scale_b", [False, True])
 def test_lds_a_tile(dtype, num_bits, group_size, shape_m, scale_b):
-    tile = MfmaTile(1, 4, 8, 2, 2, lds_a=True, scale_b=scale_b) if scale_b else MfmaTile(2, 2, 4, 4, 2, lds_a=True)
+    tile = (
+        MfmaTile(1, 4, 8, 2, 2, lds_a=True, scale_b=scale_b)
+        if scale_b
+        else MfmaTile(2, 2, 4, 4, 2, lds_a=True)
+    )
     _, rel = run_case(shape_m, 384, 1024, num_bits, group_size, group_size > 0, dtype, tile=tile)
     assert rel < TOLERANCE[dtype]
 
@@ -99,7 +105,7 @@ def test_tile_buckets(is_bfloat16, shape_n, num_bits, shape_k):
     num_cus = 256
     intervals = gfx950.get_m_intervals(shape_n, num_cus, is_bfloat16, num_bits)
     assert intervals[0][0] == 0 and intervals[-1][1] == 1 << 30
-    for (_, high), (low, _) in zip(intervals, intervals[1:]):
+    for (_, high), (low, _) in zip(intervals[:-1], intervals[1:], strict=True):
         assert high == low
     for low, high in intervals:
         probes = {low + 1, min(high, low + 129), min(high, 1 << 16)}

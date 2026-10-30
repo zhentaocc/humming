@@ -1,10 +1,9 @@
 import dataclasses
 import os
 import threading
+from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, ClassVar
-
-from collections.abc import Sequence
 
 import torch
 
@@ -194,7 +193,9 @@ class KernelRuntime:
         grid_dims = (*grid, 1, 1)[:3]
         block_dims = (*block, 1, 1)[:3]
         if current_device.is_rocm:
-            hip_runtime.launch_kernel(func, grid_dims, block_dims, stream, arg_values, arg_types, shared_memory_bytes)
+            hip_runtime.launch_kernel(
+                func, grid_dims, block_dims, stream, arg_values, arg_types, shared_memory_bytes
+            )
             return
         config = cbd.CUlaunchConfig()
         config.gridDimX, config.gridDimY, config.gridDimZ = grid_dims

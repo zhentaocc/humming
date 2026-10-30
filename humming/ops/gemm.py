@@ -115,7 +115,9 @@ def humming_gemm(
     )
 
 
-def _humming_gemm_rocm(*, layer_config: str, inputs: torch.Tensor, outputs: torch.Tensor | None, bias, **kwargs):
+def _humming_gemm_rocm(
+    *, layer_config: str, inputs: torch.Tensor, outputs: torch.Tensor | None, bias, **kwargs
+):
     """ROCm MFMA GEMM: pads K / N for the kernel's 128 / 64 alignment and adds the bias here."""
     from humming.kernel.humming_mfma import get_mfma_gemm_meta, get_mfma_num_experts
 
@@ -125,7 +127,9 @@ def _humming_gemm_rocm(*, layer_config: str, inputs: torch.Tensor, outputs: torc
     if get_mfma_num_experts(layer_config):
         # MoE: the kernel writes only the unpadded N columns and adds the per-expert bias itself.
         if outputs is None:
-            out_n, output_dtype, is_indexed = _get_humming_gemm_output_meta(layer_config, kwargs.get("compute_config"))
+            out_n, output_dtype, is_indexed = _get_humming_gemm_output_meta(
+                layer_config, kwargs.get("compute_config")
+            )
             rows = inputs.size(0) * (kwargs.get("top_k", 1) if is_indexed else 1)
             outputs = inputs.new_empty((rows, out_n), dtype=output_dtype)
         return _humming_gemm(layer_config=layer_config, inputs=inputs, outputs=outputs, bias=bias, **kwargs)
